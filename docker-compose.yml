@@ -1,0 +1,41 @@
+# Local development only. Production runs the image against managed Postgres.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: als
+      POSTGRES_PASSWORD: als
+      POSTGRES_DB: als
+    ports:
+      - "5432:5432"
+    volumes:
+      - als-postgres:/var/lib/postgresql/data
+    healthcheck:
+      # The API waits for this, so a cold `up` does not race the database and
+      # crash-loop on the first connection.
+      test: ["CMD-SHELL", "pg_isready -U als -d als"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://als:als@db:5432/als
+      ENVIRONMENT: development
+      DEBUG: "true"
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+volumes:
+  als-postgres:

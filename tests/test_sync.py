@@ -1,0 +1,274 @@
+"""
+Sync: the parts that are easy to get subtly wrong.
+
+Idempotency, conflict resolution, tombstones and ownership. Every one of these
+fails silently rather than loudly if it regresses — a duplicate row or a lost
+edit does not raise, it just quietly ruins someone's semester.
+"""
+
+import uuid
+from datetime import UTC, datetime, timedelta
+
+from tests.conftest import OTHER_PHONE, sign_in
+
+
+def _unit(unit_id=None, *, code="CS201", title="Data Structures", updated=None, deleted=None):
+    return {
+        "id": str(unit_id or uuid.uuid4()),
+        "code": code,
+        "title": title,
+        "lecturer": "",
+        "updated_at": (updated or datetime.now(UTC)).isoformat(),
+        "deleted_at": deleted.isoformat() if deleted else None,
+    }
+
+
+async def test_push_then_pull_round_trips(client):
+    headers, _ = await sign_in(client)
+    unit = _unit()
+
+    pushed = await client.post(
+        "/api/v1/sync", json={"units": [unit]}, headers=headers
+    )
+    assert pushed.status_code == 200
+    assert pushed.json()["units"]["applied"] == 1
+
+    pulled = await client.get("/api/v1/sync", headers=headers)
+    assert pulled.status_code == 200
+    units = pulled.json()["units"]
+    assert len(units) == 1
+    assert units[0]["code"] == "CS201"
+
+
+async def test_pushing_the_same_row_twice_changes_nothing(client):
+    headers, _ = await sign_in(client)
+    unit = _unit()
+
+    first = await client.post("/api/v1/sync", json={"units": [unit]}, headers=headers)
+    second = await client.post("/api/v1/sync", json={"units": [unit]}, headers=headers)
+
+    assert first.json()["units"]["applied"] == 1
+    # Same timestamp, so the replay is a no-op rather than a second write.
+    assert second.json()["units"]["skipped"] == 1
+
+    pulled = await client.get("/api/v1/sync", headers=headers)
+    assert len(pulled.json()["units"]) == 1
+
+
+async def test_a_newer_edit_wins(client):
+    headers, _ = await sign_in(client)
+    unit_id = uuid.uuid4()
+    now = datetime.now(UTC)
+
+    await client.post(
+        "/api/v1/sync",
+        json={"units": [_unit(unit_id, title="Old", updated=now)]},
+        headers=headers,
+    )
+    await client.post(
+        "/api/v1/sync",
+        json={
+            "units": [
+                _unit(unit_id, title="New", updated=now + timedelta(minutes=1))
+            ]
+        },
+        headers=headers,
+    )
+
+    pulled = await client.get("/api/v1/sync", headers=headers)
+    assert pulled.json()["units"][0]["title"] == "New"
+
+
+async def test_a_stale_edit_is_refused(client):
+    """A phone that has been in a drawer must not overwrite newer work."""
+    headers, _ = await sign_in(client)
+    unit_id = uuid.uuid4()
+    now = datetime.now(UTC)
+
+    await client.post(
+        "/api/v1/sync",
+        json={"units": [_unit(unit_id, title="Current", updated=now)]},
+        headers=headers,
+    )
+    stale = await client.post(
+        "/api/v1/sync",
+        json={
+            "units": [
+                _unit(unit_id, title="Stale", updated=now - timedelta(hours=5))
+            ]
+        },
+        headers=headers,
+    )
+
+    assert stale.json()["units"]["skipped"] == 1
+    pulled = await client.get("/api/v1/sync", headers=headers)
+    assert pulled.json()["units"][0]["title"] == "Current"
+
+
+async def test_a_deletion_travels_as_a_tombstone(client):
+    """A row that simply vanished would be pushed straight back by a device."""
+    headers, _ = await sign_in(client)
+    unit_id = uuid.uuid4()
+    now = datetime.now(UTC)
+
+    await client.post(
+        "/api/v1/sync", json={"units": [_unit(unit_id, updated=now)]}, headers=headers
+    )
+    await client.post(
+        "/api/v1/sync",
+        json={
+            "units": [
+                _unit(unit_id, updated=now + timedelta(seconds=1), deleted=now)
+            ]
+        },
+        headers=headers,
+    )
+
+    units = (await client.get("/api/v1/sync", headers=headers)).json()["units"]
+    assert len(units) == 1
+    assert units[0]["deleted_at"] is not None
+
+
+async def test_the_cursor_only_returns_what_changed(client):
+    headers, _ = await sign_in(client)
+    now = datetime.now(UTC)
+
+    await client.post(
+        "/api/v1/sync", json={"units": [_unit(updated=now)]}, headers=headers
+    )
+    first = await client.get("/api/v1/sync", headers=headers)
+    cursor = first.json()["cursor"]
+
+    # Nothing has changed since, so a second pull is empty.
+    again = await client.get(f"/api/v1/sync?since={cursor}", headers=headers)
+    assert again.json()["units"] == []
+
+    await client.post(
+        "/api/v1/sync",
+        json={"units": [_unit(code="MAT204", updated=now + timedelta(minutes=5))]},
+        headers=headers,
+    )
+    third = await client.get(f"/api/v1/sync?since={cursor}", headers=headers)
+    assert len(third.json()["units"]) == 1
+    assert third.json()["units"][0]["code"] == "MAT204"
+
+
+async def test_one_student_never_sees_another(client):
+    mine, _ = await sign_in(client)
+    theirs, _ = await sign_in(client, phone=OTHER_PHONE)
+
+    await client.post("/api/v1/sync", json={"units": [_unit()]}, headers=mine)
+
+    assert (await client.get("/api/v1/sync", headers=theirs)).json()["units"] == []
+
+
+async def test_the_unit_cap_rejects_the_row_not_the_request(client):
+    """
+    A trial allows two units. The third is refused — and everything else in the
+    same push still has to land.
+    """
+    headers, _ = await sign_in(client)
+    now = datetime.now(UTC)
+
+    response = await client.post(
+        "/api/v1/sync",
+        json={
+            "units": [
+                _unit(code="AAA101", updated=now),
+                _unit(code="BBB202", updated=now),
+                _unit(code="CCC303", updated=now),
+            ],
+            "events": [
+                {
+                    "id": str(uuid.uuid4()),
+                    "title": "Essay",
+                    "kind": "assignment",
+                    "label": "",
+                    "due_at": None,
+                    "done": False,
+                    "updated_at": now.isoformat(),
+                    "deleted_at": None,
+                }
+            ],
+        },
+        headers=headers,
+    )
+
+    body = response.json()
+    assert body["units"]["applied"] == 2
+    assert len(body["units"]["rejected"]) == 1
+    # The event is not held hostage by the rejected unit.
+    assert body["events"]["applied"] == 1
+
+
+async def test_editing_an_existing_unit_is_never_capped(client):
+    headers, _ = await sign_in(client)
+    now = datetime.now(UTC)
+    first = uuid.uuid4()
+    second = uuid.uuid4()
+
+    await client.post(
+        "/api/v1/sync",
+        json={
+            "units": [
+                _unit(first, code="AAA101", updated=now),
+                _unit(second, code="BBB202", updated=now),
+            ]
+        },
+        headers=headers,
+    )
+
+    # At the cap, but this is an edit, not a new unit.
+    edited = await client.post(
+        "/api/v1/sync",
+        json={
+            "units": [
+                _unit(first, code="AAA101", title="Renamed", updated=now + timedelta(minutes=1))
+            ]
+        },
+        headers=headers,
+    )
+
+    assert edited.json()["units"]["applied"] == 1
+    assert edited.json()["units"]["rejected"] == []
+
+
+async def test_chats_carry_their_messages_and_do_not_duplicate(client):
+    headers, _ = await sign_in(client)
+    now = datetime.now(UTC)
+    chat_id = uuid.uuid4()
+    message_id = uuid.uuid4()
+
+    payload = {
+        "chats": [
+            {
+                "id": str(chat_id),
+                "title": "How do hash tables work?",
+                "unit_id": None,
+                "updated_at": now.isoformat(),
+                "deleted_at": None,
+                "messages": [
+                    {
+                        "id": str(message_id),
+                        "role": "student",
+                        "content": "How do hash tables work?",
+                        "sources": None,
+                        "created_at": now.isoformat(),
+                    }
+                ],
+            }
+        ]
+    }
+
+    await client.post("/api/v1/sync", json=payload, headers=headers)
+    # Replaying must not duplicate the message.
+    await client.post("/api/v1/sync", json=payload, headers=headers)
+
+    chats = (await client.get("/api/v1/sync", headers=headers)).json()["chats"]
+    assert len(chats) == 1
+    assert len(chats[0]["messages"]) == 1
+
+
+async def test_sync_needs_a_token(client):
+    assert (await client.post("/api/v1/sync", json={})).status_code == 401
+    assert (await client.get("/api/v1/sync")).status_code == 401

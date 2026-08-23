@@ -1,0 +1,146 @@
+import uuid
+from datetime import datetime, time
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class SyncRow(BaseModel):
+    """
+    What every synced row carries.
+
+    ``id`` comes from the device and ``updated_at`` is the whole conflict
+    resolution story — see ``app/services/sync.py``.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    updated_at: datetime
+    deleted_at: datetime | None = None
+
+
+class UnitIn(SyncRow):
+    code: str = Field(max_length=16)
+    title: str = Field(max_length=200)
+    lecturer: str = Field(default="", max_length=160)
+
+
+class ClassSessionIn(SyncRow):
+    unit_id: uuid.UUID
+    #: 0 = Sunday, matching JavaScript's getDay().
+    weekday: int = Field(ge=0, le=6)
+    starts_at: time
+    ends_at: time
+    room: str = Field(default="", max_length=80)
+
+
+class MaterialIn(SyncRow):
+    unit_id: uuid.UUID
+    kind: str = Field(default="note", max_length=16)
+    title: str = Field(max_length=300)
+    body: str = ""
+    archived: bool = False
+
+
+class EventIn(SyncRow):
+    unit_id: uuid.UUID | None = None
+    title: str = Field(max_length=300)
+    kind: str = Field(default="assignment", max_length=16)
+    label: str = Field(default="", max_length=80)
+    due_at: datetime | None = None
+    done: bool = False
+
+
+class MessageIn(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    role: str = Field(max_length=16)
+    content: str
+    sources: list | None = None
+    created_at: datetime
+
+
+class ChatIn(SyncRow):
+    unit_id: uuid.UUID | None = None
+    title: str = Field(default="New chat", max_length=120)
+    messages: list[MessageIn] = Field(default_factory=list)
+
+
+class SyncPush(BaseModel):
+    """
+    Everything a device wants to write, in one request.
+
+    One request rather than one per table: a phone coming back from a day
+    offline has changes in several tables that belong to the same moment, and
+    six requests over a bad connection is six chances to half-succeed.
+    """
+
+    units: list[UnitIn] = Field(default_factory=list)
+    class_sessions: list[ClassSessionIn] = Field(default_factory=list)
+    materials: list[MaterialIn] = Field(default_factory=list)
+    events: list[EventIn] = Field(default_factory=list)
+    chats: list[ChatIn] = Field(default_factory=list)
+
+
+class TableResult(BaseModel):
+    applied: int = 0
+    #: Rows the server already had a newer version of. Not an error — the
+    #: device simply had stale data, and knowing the count makes a sync that
+    #: quietly does nothing debuggable.
+    skipped: int = 0
+    rejected: list[str] = Field(default_factory=list)
+
+
+class SyncPushResult(BaseModel):
+    units: TableResult = Field(default_factory=TableResult)
+    class_sessions: TableResult = Field(default_factory=TableResult)
+    materials: TableResult = Field(default_factory=TableResult)
+    events: TableResult = Field(default_factory=TableResult)
+    chats: TableResult = Field(default_factory=TableResult)
+
+    #: Pass back as ``since`` on the next pull.
+    cursor: datetime
+
+
+class UnitOut(UnitIn):
+    pass
+
+
+class ClassSessionOut(ClassSessionIn):
+    pass
+
+
+class MaterialOut(MaterialIn):
+    storage_bucket: str | None = None
+    storage_path: str | None = None
+    page_count: int | None = None
+    extraction_status: str = "pending"
+
+
+class EventOut(EventIn):
+    pass
+
+
+class ChatOut(ChatIn):
+    pass
+
+
+class SyncPull(BaseModel):
+    """
+    Everything that changed after the cursor, tombstones included.
+
+    Deletions travel as rows with ``deleted_at`` set. A row that simply
+    vanished would be invisible to a device that has been offline, which would
+    then push it straight back.
+    """
+
+    units: list[UnitOut] = Field(default_factory=list)
+    class_sessions: list[ClassSessionOut] = Field(default_factory=list)
+    materials: list[MaterialOut] = Field(default_factory=list)
+    events: list[EventOut] = Field(default_factory=list)
+    chats: list[ChatOut] = Field(default_factory=list)
+
+    cursor: datetime
+    #: True when the page hit the row limit and another pull is needed.
+    has_more: bool = False

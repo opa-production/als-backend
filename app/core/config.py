@@ -44,16 +44,31 @@ class Settings(BaseSettings):
     @classmethod
     def _must_be_async(cls, value: str) -> str:
         """
-        A ``postgresql://`` URL loads the *sync* driver without complaint, and
-        every query then blocks the event loop. That is close to impossible to
-        spot from the outside — the service just gets mysteriously slow under
-        load — so it is rejected here instead.
+        Forces the asyncpg driver, rewriting the URL where that is unambiguous.
+
+        A bare ``postgresql://`` URL loads the *sync* driver without complaint,
+        and every query then blocks the event loop. That is close to impossible
+        to spot from the outside — the service just gets mysteriously slow under
+        load.
+
+        Hosted Postgres hands out exactly that form (Render, Heroku and Supabase
+        all do, some still with the legacy ``postgres://`` scheme), so rejecting
+        it means every deploy depends on someone remembering to retype the
+        connection string. Since a driverless URL states no driver preference,
+        it is upgraded here rather than refused. A URL naming some *other*
+        driver is a real disagreement and still fails.
         """
-        if not value.startswith("postgresql+asyncpg://"):
-            raise ValueError(
-                "DATABASE_URL must use the asyncpg driver: postgresql+asyncpg://..."
-            )
-        return value
+        for scheme in ("postgresql+asyncpg://",):
+            if value.startswith(scheme):
+                return value
+
+        for scheme in ("postgresql://", "postgres://"):
+            if value.startswith(scheme):
+                return "postgresql+asyncpg://" + value[len(scheme) :]
+
+        raise ValueError(
+            "DATABASE_URL must use the asyncpg driver: postgresql+asyncpg://..."
+        )
 
     # --- Auth -------------------------------------------------------------
     jwt_secret: str = "change-me-in-every-environment"

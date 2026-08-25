@@ -1,0 +1,90 @@
+# Render blueprint. Create the stack from this file with Render's
+# "New > Blueprint" flow rather than clicking a service together by hand, so
+# the environment is reviewable in git.
+#
+# Free plan, chosen for testing before committing to a VPS:
+#   * the web service sleeps after 15 minutes idle and takes ~50s to wake, so
+#     the first request after a quiet spell looks like a hang, not a bug;
+#   * the database is deleted 30 days after creation.
+
+services:
+  - type: web
+    name: als-api
+    runtime: python
+    plan: free
+    # Closest region to East Africa. Render has no African region.
+    region: frankfurt
+
+    buildCommand: pip install --upgrade pip && pip install .
+    # `sh` explicitly: the executable bit does not survive every checkout from
+    # a Windows working tree, and a start command that is merely non-executable
+    # fails as an opaque "exec format" error.
+    startCommand: sh ./scripts/start.sh
+
+    healthCheckPath: /health
+
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+
+      # Render's internal connection string, in `postgresql://` form. The
+      # settings validator rewrites it to the asyncpg driver on load.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: als-postgres
+          property: connectionString
+
+      # Generated once by Render and never shown in this file. Rotating it
+      # invalidates every issued access and refresh token.
+      - key: JWT_SECRET
+        generateValue: true
+
+      # Deliberately not "production": that turns off /docs and /openapi.json,
+      # and this deploy exists to be poked at through Swagger.
+      - key: ENVIRONMENT
+        value: staging
+      - key: DEBUG
+        value: "false"
+
+      # One worker, small pool. The free instance has 512MB and the free
+      # database a low connection ceiling; the defaults (2 workers x 30
+      # connections) would exhaust it.
+      - key: WEB_CONCURRENCY
+        value: "1"
+      - key: DATABASE_POOL_SIZE
+        value: "5"
+      - key: DATABASE_MAX_OVERFLOW
+        value: "5"
+      # Render Postgres is a direct connection, not a transaction pooler.
+      - key: DATABASE_USE_PGBOUNCER
+        value: "false"
+
+      # Left blank on purpose -- each one degrades to something usable:
+      #   SMS_*        blank -> OTP codes are written to the Render log
+      #   SUPABASE_*   blank -> only /materials/* is unavailable
+      #   GOOGLE_*     blank -> /auth/google returns "not configured"
+      #   PAYSTACK_*   blank -> only /billing/verify and the webhook
+      # Fill them in from the Render dashboard when you want to test that path.
+      - key: SMS_API_KEY
+        sync: false
+      - key: SMS_PARTNER_ID
+        sync: false
+      - key: SMS_SENDER_ID
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_IDS
+        sync: false
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+      - key: PAYSTACK_WEBHOOK_SECRET
+        sync: false
+
+databases:
+  - name: als-postgres
+    plan: free
+    region: frankfurt
+    databaseName: als
+    user: als

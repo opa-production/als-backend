@@ -7,11 +7,17 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.api.deps import CurrentUser, DbSession, HttpClient
+from app.core.config import settings
 from app.core.errors import AppError, Forbidden, NotFound
 from app.models.account import User
 from app.models.billing import PlanGroup, PlanGroupMember
 from app.services import billing as billing_service
-from app.services.paystack import verify_signature, verify_transaction
+from app.services.paystack import (
+    initialize_transaction,
+    new_reference,
+    verify_signature,
+    verify_transaction,
+)
 from app.services.plans import PLANS, SELLABLE, Tier, plan_for
 from app.services.quota import get_entitlement
 
@@ -42,6 +48,20 @@ class SubscriptionOut(BaseModel):
     seats: int
     #: True when nothing metered is available any more.
     is_expired: bool
+
+
+class CheckoutRequest(BaseModel):
+    tier: str = Field(description="Which plan to buy: standard, pro or friends.")
+
+
+class CheckoutOut(BaseModel):
+    #: Open this in a browser. It is single-use and belongs to one student.
+    authorization_url: str
+    #: Hand this back to /billing/verify when the browser closes.
+    reference: str
+    tier: str
+    plan_name: str
+    amount_ksh: int
 
 
 class VerifyRequest(BaseModel):
@@ -118,6 +138,78 @@ async def read_subscription(user: CurrentUser, session: DbSession) -> Subscripti
         verified=entitlement.verified,
         seats=plan.seats,
         is_expired=entitlement.is_expired,
+    )
+
+
+@router.post("/checkout", response_model=CheckoutOut, summary="Start a payment")
+async def start_checkout(
+    payload: CheckoutRequest,
+    user: CurrentUser,
+    session: DbSession,
+    http: HttpClient,
+) -> CheckoutOut:
+    """
+    Opens a Paystack page for this student and this plan.
+
+    The app used to ship three fixed ``paystack.shop/pay/...`` links. Those
+    work, but they are the same page for everyone: the charge that comes back
+    names no account, so the only thread tying it to a student is the email
+    they happened to type — and most sign in with a phone number and never
+    have one. Everything downstream then has to guess, and
+    ``assert_charge_belongs_to`` was left refusing honest payments.
+
+    Here the price comes from the server's own plan table and the metadata is
+    written from the caller's token, so the charge arrives already knowing who
+    it belongs to and what it bought. The reference is returned so the app can
+    verify the exact transaction it opened rather than asking the student
+    whether they paid.
+    """
+    try:
+        tier = Tier(payload.tier)
+    except ValueError:
+        tier = None
+
+    if tier not in SELLABLE:
+        raise AppError("That is not a plan you can buy.")
+
+    plan = PLANS[tier]
+
+    checkout = await initialize_transaction(
+        http,
+        email=billing_service.receipt_email(user),
+        # From the plan table, never from the request. A price the client
+        # sends is a price the client can choose.
+        amount_kes=plan.price_ksh,
+        reference=new_reference(),
+        metadata={
+            "user_id": str(user.id),
+            "tier": tier.value,
+            # Shown on the Paystack dashboard beside the charge, which is
+            # where anyone reconciling a payment actually looks.
+            "custom_fields": [
+                {
+                    "display_name": "Plan",
+                    "variable_name": "plan",
+                    "value": plan.name,
+                },
+            ],
+        },
+        callback_url=settings.paystack_callback_url or None,
+    )
+
+    log.info(
+        "checkout_started",
+        user_id=str(user.id),
+        tier=tier.value,
+        reference=checkout.reference,
+    )
+
+    return CheckoutOut(
+        authorization_url=checkout.authorization_url,
+        reference=checkout.reference,
+        tier=tier.value,
+        plan_name=plan.name,
+        amount_ksh=plan.price_ksh,
     )
 
 

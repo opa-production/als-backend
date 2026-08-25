@@ -63,7 +63,8 @@ services:
       #   SMS_*        blank -> OTP codes are written to the Render log
       #   SUPABASE_*   blank -> only /materials/* is unavailable
       #   GOOGLE_*     blank -> /auth/google returns "not configured"
-      #   PAYSTACK_*   blank -> only /billing/verify and the webhook
+      #   PAYSTACK_*   blank -> /billing/checkout and /billing/verify both
+      #                         report that payments are not configured
       # Fill them in from the Render dashboard when you want to test that path.
       - key: SMS_API_KEY
         sync: false
@@ -80,6 +81,10 @@ services:
       - key: PAYSTACK_SECRET_KEY
         sync: false
       - key: PAYSTACK_WEBHOOK_SECRET
+        sync: false
+      # Blank uses the Paystack dashboard's callback. Set to als://billing
+      # to return the student straight to the app after paying.
+      - key: PAYSTACK_CALLBACK_URL
         sync: false
 
 databases:

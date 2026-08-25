@@ -40,6 +40,7 @@ live.
 | `GET /materials/{id}/download-url` | Short-lived signed URL. |
 | Units / events / classes CRUD | Mostly covered by `/sync`; discrete routes only where the app needs one row. |
 | `GET /billing/subscription` | — |
+| `POST /billing/checkout` | Paystack secret key. Issues the payment link, so the charge carries a user id. |
 | `POST /billing/verify` | Paystack secret key. |
 | `POST /billing/webhook` | Paystack webhook secret. **This is what makes a subscription real** — the app currently writes `verified: false` on a student's word. |
 | Friends group: create / invite / join / members | Seat accounting. |

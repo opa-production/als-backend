@@ -121,6 +121,27 @@ class Settings(BaseSettings):
     paystack_secret_key: str = ""
     paystack_webhook_secret: str = ""
 
+    #: Where Paystack sends the browser once a payment succeeds.
+    #:
+    #: Blank means "use whatever the Paystack dashboard is set to", which is
+    #: the safe default: the app does not depend on this redirect, it verifies
+    #: the reference it was given when the browser closes. Set it to the app's
+    #: deep link (``als://billing``) to have the payment page bounce straight
+    #: back into the app instead.
+    paystack_callback_url: str = ""
+
+    #: Domain for the stand-in address used when an account has no email.
+    #:
+    #: Paystack requires an email on every transaction and phone sign-in does
+    #: not collect one. The address is per-account and never receives mail —
+    #: it exists so a charge can be opened at all, and `metadata.user_id` is
+    #: what actually ties the payment to a student.
+    receipt_email_domain: str = "als.ardena.co.ke"
+
+    @property
+    def payments_configured(self) -> bool:
+        return bool(self.paystack_secret_key)
+
     # --- Outbound ---------------------------------------------------------
     #: Every outbound call gets a deadline. A hung upstream must fail in
     #: seconds rather than hold a worker until the container is killed.

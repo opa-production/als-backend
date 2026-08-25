@@ -10,7 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.clock import as_utc
 from app.core.clock import now as utc_now
+from app.core.config import settings
 from app.core.errors import AppError, NotFound
+from app.models.account import User
 from app.models.billing import (
     Payment,
     PlanGroup,
@@ -33,6 +35,21 @@ CODE_LENGTH = 8
 
 def _new_invite_code() -> str:
     return "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH))
+
+
+def receipt_email(user: User) -> str:
+    """
+    An address to open a Paystack transaction against.
+
+    Paystack requires one on every charge; phone sign-in never collects one.
+    Rather than refuse to sell a plan to a student who signed in with a number,
+    a stand-in derived from their account id is used. It is stable, so repeat
+    payments group under one Paystack customer, and it is never written to —
+    ``metadata.user_id`` is what actually identifies the payer.
+    """
+    if user.email:
+        return user.email
+    return f"student-{user.id.hex[:12]}@{settings.receipt_email_domain}"
 
 
 async def get_or_create_subscription(

@@ -10,10 +10,13 @@ import hashlib
 import hmac
 import json
 
+import httpx
 import pytest
 
+from app.api.deps import get_http_client
 from app.core.clock import now as utc_now
 from app.core.config import settings
+from app.main import app
 from app.services.billing import activate, tier_from_charge
 from app.services.paystack import Charge, verify_signature
 from app.services.plans import Tier, plan_for
@@ -205,6 +208,130 @@ async def test_only_sellable_plans_are_advertised(client):
     friends = next(p for p in body if p["id"] == "friends")
     assert friends["seats"] == 5
     assert friends["price_per_seat_ksh"] == 250
+
+
+# --- Checkout -----------------------------------------------------------------
+
+
+class _FakePaystack:
+    """
+    Stands in for Paystack and remembers what it was sent.
+
+    What matters in these tests is the *request* — the amount and the metadata
+    are what a wrong checkout gets wrong, and both are decided on this side
+    rather than by Paystack.
+    """
+
+    def __init__(self):
+        self.payload = None
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        self.payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "status": True,
+                "data": {
+                    "authorization_url": "https://checkout.paystack.com/abc123",
+                    "access_code": "abc123",
+                    "reference": self.payload["reference"],
+                },
+            },
+        )
+
+
+@pytest.fixture
+def paystack(client, monkeypatch):
+    """
+    Swaps the *outbound* client only.
+
+    Patching ``httpx.AsyncClient.post`` would also intercept the test client's
+    own requests into the app, since both are httpx — so the seam is the
+    dependency, not the library.
+    """
+    monkeypatch.setattr(settings, "paystack_secret_key", "sk_test_x")
+    fake = _FakePaystack()
+
+    outbound = httpx.AsyncClient(transport=httpx.MockTransport(fake.handle))
+    app.dependency_overrides[get_http_client] = lambda: outbound
+
+    return fake
+
+
+async def test_checkout_returns_a_link_and_its_reference(client, paystack):
+    headers, _ = await sign_in(client)
+
+    response = await client.post(
+        "/api/v1/billing/checkout", json={"tier": "pro"}, headers=headers
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["authorization_url"].startswith("https://")
+    assert body["reference"]
+    assert body["amount_ksh"] == plan_for(Tier.PRO).price_ksh
+
+
+async def test_checkout_names_the_payer_in_the_metadata(client, paystack):
+    """
+    The whole reason the link is issued here rather than shipped in the app.
+    Without this, the charge that comes back belongs to nobody in particular
+    and `assert_charge_belongs_to` has only an email to go on.
+    """
+    headers, user_id = await sign_in(client)
+
+    await client.post(
+        "/api/v1/billing/checkout", json={"tier": "friends"}, headers=headers
+    )
+
+    assert paystack.payload["metadata"]["user_id"] == str(user_id)
+    assert paystack.payload["metadata"]["tier"] == "friends"
+
+
+async def test_checkout_prices_the_plan_from_the_server(client, paystack):
+    """
+    In the minor unit, and from the plan table. A price the client could send
+    is a price the client could choose.
+    """
+    headers, _ = await sign_in(client)
+
+    await client.post(
+        "/api/v1/billing/checkout", json={"tier": "standard"}, headers=headers
+    )
+
+    assert paystack.payload["amount"] == plan_for(Tier.STANDARD).price_ksh * 100
+    assert paystack.payload["currency"] == "KES"
+
+
+async def test_a_tier_that_is_not_for_sale_cannot_be_bought(client, paystack):
+    headers, _ = await sign_in(client)
+
+    for tier in ("trial", "expired", "nonsense"):
+        response = await client.post(
+            "/api/v1/billing/checkout", json={"tier": tier}, headers=headers
+        )
+        assert response.status_code == 400
+
+    assert paystack.payload is None
+
+
+async def test_checkout_needs_a_signed_in_student(client, paystack):
+    response = await client.post("/api/v1/billing/checkout", json={"tier": "pro"})
+    assert response.status_code == 401
+
+
+async def test_a_student_with_no_email_can_still_pay(client, paystack):
+    """
+    Phone sign-in collects no email and Paystack demands one. Refusing to sell
+    a plan over that would lock out most of the intended users.
+    """
+    headers, _ = await sign_in(client)
+
+    await client.post(
+        "/api/v1/billing/checkout", json={"tier": "pro"}, headers=headers
+    )
+
+    assert "@" in paystack.payload["email"]
 
 
 # --- Friends ------------------------------------------------------------------

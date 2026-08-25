@@ -1,0 +1,65 @@
+# systemd unit for the ALS API. Installed to /etc/systemd/system/ by
+# scripts/provision.sh.
+
+[Unit]
+Description=ALS API
+# network-online, not just network: uvicorn binds immediately and Supabase is
+# resolved on the first request, but a boot-time restart loop is avoided by
+# waiting for a routable address.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=als
+Group=als
+WorkingDirectory=/opt/als-backend
+
+# A default, set before the file is read so it can still be overridden there.
+# systemd expands ${WEB_CONCURRENCY} in ExecStart literally: if it were unset,
+# uvicorn would be handed `--workers` with no value and fail to start.
+Environment=WEB_CONCURRENCY=2
+
+# Secrets live outside the git working tree, root-owned and 0600, so a bad
+# checkout or a world-readable repo can never expose them.
+EnvironmentFile=/etc/als-backend/env
+
+# --proxy-headers with a localhost-only trust list: nginx is the only thing
+# that may set X-Forwarded-For. Trusting every peer would let any client forge
+# its own address in the logs.
+ExecStart=/opt/als-backend/.venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --workers ${WEB_CONCURRENCY} \
+    --proxy-headers \
+    --forwarded-allow-ips=127.0.0.1
+
+# SIGTERM to the whole group, then a real grace period: in-flight requests get
+# to finish instead of being cut off on every deploy.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=30
+
+Restart=always
+RestartSec=3
+
+# Hardening. The service needs nothing but its own directory and the network.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+# Writable paths must be listed explicitly under ProtectSystem=strict.
+ReadWritePaths=/opt/als-backend
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=als-backend
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,104 @@
+# Test every push and pull request; deploy master to the VPS when it passes.
+#
+# Required repository secrets (Settings > Secrets and variables > Actions):
+#
+#   SSH_HOST       the VPS public IP
+#   SSH_USER       als
+#   SSH_KEY        the private key printed by scripts/provision.sh
+#
+# Optional:
+#
+#   SSH_PORT       if sshd does not listen on 22
+#   SSH_HOST_KEY   the server's public host key line. Without it the first
+#                  connection of every run trusts whatever answers on that
+#                  address. Get it with: ssh-keyscan -t ed25519 <SSH_HOST>
+
+name: CI and deploy
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# One deploy at a time, and never cancel one halfway: an interrupted run can
+# leave the server mid-migration with the old code still serving.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint, tests, migration drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Tests
+        run: pytest -q
+
+      # The deploy runs `alembic upgrade head`. If a model gained a column and
+      # nobody wrote the migration, that command succeeds without doing
+      # anything and production quietly runs one column behind its own code.
+      # Needs no database: the migrations are compiled to DDL, not executed.
+      - name: Migrations match the models
+        run: python scripts/check_migrations.py
+
+  deploy:
+    name: Deploy to the VPS
+    needs: test
+    # Pull requests get the tests and nothing else.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Authorise the SSH key
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_HOST_KEY: ${{ secrets.SSH_HOST_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "$SSH_HOST_KEY" ]; then
+            printf '%s\n' "$SSH_HOST_KEY" >> ~/.ssh/known_hosts
+          else
+            echo "SSH_HOST_KEY is not set -- trusting the host on first sight."
+            ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          fi
+
+      # The commit is passed explicitly rather than letting the server take
+      # whatever origin/master points at, so a push that lands while this runs
+      # cannot slip an untested commit into the deploy.
+      - name: Deploy
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          ssh -p "${SSH_PORT:-22}" \
+              -o BatchMode=yes \
+              -o ConnectTimeout=15 \
+              "$SSH_USER@$SSH_HOST" \
+              "bash /opt/als-backend/scripts/deploy.sh '$GIT_SHA'"

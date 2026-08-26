@@ -85,6 +85,36 @@ fi
 
 git reset --hard --quiet "$TARGET_SHA"
 
+# --- The virtualenv -----------------------------------------------------------
+#
+# Built here if it is missing, rather than assumed. provision.sh creates it, but
+# a box can end up without one for ordinary reasons: provisioning that stopped
+# half way, a venv built against a Python that has since been removed, or a
+# restore that skipped it because .venv is gitignored.
+#
+# Recreating is safe and idempotent — nothing in it is state. Everything it
+# holds comes from pyproject.toml, and the next two lines rebuild it anyway.
+if [ ! -x .venv/bin/pip ]; then
+    if [ -e .venv ]; then
+        echo "==> .venv exists but has no working pip -- rebuilding it"
+        rm -rf .venv
+    else
+        echo "==> no virtualenv -- creating one"
+    fi
+
+    # Matches provision.sh. The fallback matters on a box where 3.12 is the
+    # system python and the versioned name was never installed.
+    VENV_PYTHON=python3.12
+    command -v "$VENV_PYTHON" > /dev/null 2>&1 || VENV_PYTHON=python3
+
+    if ! "$VENV_PYTHON" -m venv .venv; then
+        echo "!! could not create a virtualenv with $VENV_PYTHON." >&2
+        echo "!! the venv module is packaged separately on Debian and Ubuntu:" >&2
+        echo "!!     sudo apt-get install -y ${VENV_PYTHON}-venv" >&2
+        exit 1
+    fi
+fi
+
 echo "==> installing dependencies"
 .venv/bin/pip install --quiet --upgrade pip
 .venv/bin/pip install --quiet .

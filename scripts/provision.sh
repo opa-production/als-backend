@@ -147,23 +147,45 @@ OTP_TTL_SECONDS=600
 OTP_MAX_ATTEMPTS=5
 OTP_MAX_SENDS_PER_HOUR=5
 
-# --- Payments -----------------------------------------------------------
-PAYSTACK_SECRET_KEY=
-PAYSTACK_WEBHOOK_SECRET=
-PAYSTACK_CALLBACK_URL=
-RECEIPT_EMAIL_DOMAIN=als.ardena.co.ke
+# --- Payments (Kora) ----------------------------------------------------
+# https://korahq.com. Blank means /billing/checkout and /billing/verify report
+# that payments are unavailable; nothing else is affected.
+#
+# Kora charges the MAJOR unit (350 = KES 350) and signs webhooks over only the
+# `data` object with SHA-256. Neither needs configuring -- both are worth
+# knowing before anyone "fixes" one of them.
+KORA_SECRET_KEY=
+KORA_PUBLIC_KEY=
+# Leave blank: Kora signs webhooks with the secret key above.
+KORA_WEBHOOK_SECRET=
+# Blank uses the Kora dashboard's redirect. als://billing returns to the app.
+KORA_CALLBACK_URL=
+RECEIPT_EMAIL_DOMAIN=__DOMAIN__
+
+# --- This service's own address -----------------------------------------
+# Where Kora is told to post webhooks. Cannot be derived from a request:
+# behind nginx the app only ever sees 127.0.0.1:8000.
+PUBLIC_BASE_URL=https://__DOMAIN__
 
 # --- Outbound -----------------------------------------------------------
 HTTP_TIMEOUT_SECONDS=15
 
 # --- CORS ---------------------------------------------------------------
-# The mobile app does not use CORS. Only web origins belong here.
-CORS_ORIGINS=
+# The mobile app does not use CORS. Only web origins belong here -- the admin
+# console is the one that matters, and missing it makes every request from the
+# console fail in the browser before it reaches this service.
+CORS_ORIGINS=https://admin.__DOMAIN__
 
 # --- Process ------------------------------------------------------------
 # Two per core is the usual starting point for an IO-bound service.
 WEB_CONCURRENCY=2
 ENVTEMPLATE
+
+    # The heredoc above is quoted, so nothing in it was expanded -- which is
+    # what keeps a `$` inside a future password from being eaten. The three
+    # placeholders are filled in here instead, the same way deploy/nginx.conf
+    # is handled further down.
+    sed -i "s/__DOMAIN__/$DOMAIN/g" "$ENV_FILE"
     echo "    written -- replace every CHANGEME before starting the service"
 else
     echo "    already exists, leaving it alone"

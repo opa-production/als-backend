@@ -15,6 +15,32 @@ APP_DIR=/opt/als-backend
 HEALTH_URL=http://127.0.0.1:8000/health
 SERVICE=als-backend
 
+# --- Running from an immutable copy -------------------------------------------
+#
+# This script replaces itself part-way through: `git reset --hard` below rewrites
+# scripts/deploy.sh while bash is still executing it.
+#
+# Bash reads a script incrementally rather than loading it whole, and it tracks
+# its position as a *byte offset*. Swap the file underneath it and execution
+# resumes at that offset in the new content — which is almost never the start of
+# the line it was on. The result is a script that appears to skip its own code,
+# or runs a fragment of a line, and reports a line number that does not match
+# what is on disk. It is a genuinely confusing failure and worth ten lines to
+# make impossible.
+#
+# Copying to /tmp first makes the executing text immutable for the run.
+if [ -z "${ALS_DEPLOY_PINNED:-}" ]; then
+    pinned="$(mktemp /tmp/als-deploy.XXXXXX)"
+    cat "$0" > "$pinned"
+    export ALS_DEPLOY_PINNED="$pinned"
+
+    bash "$pinned" "$@"
+    status=$?
+
+    rm -f "$pinned"
+    exit "$status"
+fi
+
 TARGET_SHA="${1:?usage: deploy.sh <commit-sha> [repo-url]}"
 EXPECTED_REPO="${2:-}"
 
@@ -83,7 +109,39 @@ if ! git cat-file -e "${TARGET_SHA}^{commit}" 2>/dev/null; then
     exit 1
 fi
 
+SCRIPT_BEFORE="$(git rev-parse "HEAD:scripts/deploy.sh" 2>/dev/null || echo none)"
+
 git reset --hard --quiet "$TARGET_SHA"
+
+# --- Picking up a change to this script ---------------------------------------
+#
+# The commit just checked out may contain a newer version of this very file, and
+# without this the new version would not run until the *next* deploy. That is a
+# genuinely confusing lag: a fix is pushed, CI goes green on the commit that
+# contains it, the deploy fails anyway on the bug that was just fixed, and the
+# error names a line number that does not exist in the file you are reading.
+#
+# So: if the checkout changed this script, hand over to the new one. Bounded to a
+# single handover by ALS_DEPLOY_RELOADED, and the second run is cheap because the
+# fetch and reset it repeats are both no-ops by then.
+SCRIPT_AFTER="$(git rev-parse "HEAD:scripts/deploy.sh" 2>/dev/null || echo none)"
+
+if [ "$SCRIPT_BEFORE" != "$SCRIPT_AFTER" ] && [ -z "${ALS_DEPLOY_RELOADED:-}" ]; then
+    echo "==> this commit updates deploy.sh -- handing over to the new version"
+    export ALS_DEPLOY_RELOADED=1
+
+    # `exec` replaces this process, so the wrapper's cleanup never runs. Drop the
+    # copy now instead. Safe while executing from it: the inode survives an
+    # unlink until the last descriptor closes, which is what exec does anyway.
+    stale_pin="${ALS_DEPLOY_PINNED:-}"
+    # Unset so the new run pins its own copy rather than trusting this one.
+    unset ALS_DEPLOY_PINNED
+    if [ -n "$stale_pin" ]; then
+        rm -f "$stale_pin"
+    fi
+
+    exec bash "$APP_DIR/scripts/deploy.sh" "$TARGET_SHA" "$EXPECTED_REPO"
+fi
 
 # --- The virtualenv -----------------------------------------------------------
 #

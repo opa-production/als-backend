@@ -2,7 +2,16 @@
 # One-time Contabo/Ubuntu VPS setup for the ALS API. Run once, as root:
 #
 #     sudo bash provision.sh --domain api.ardena.co.ke \
-#                            --repo git@github.com:Deon62/als-backend.git
+#                            --repo https://github.com/opa-production/als-backend.git
+#
+# Use the HTTPS URL for a public repository. The SSH form needs a key
+# registered with GitHub, and the key generated below is for the opposite
+# direction — GitHub Actions into this server — so `git fetch` in deploy.sh
+# would fail with a "Permission denied (publickey)" that names github.com.
+#
+# For a private repository, clone over SSH and add a read-only deploy key:
+#     sudo -u als ssh-keygen -t ed25519 -N '' -f /home/als/.ssh/github_deploy
+#     cat /home/als/.ssh/github_deploy.pub    # -> repo Settings > Deploy keys
 #
 # Safe to re-run: every step checks before it acts. Re-run it after changing
 # deploy/als-backend.service or deploy/nginx.conf to push those out.

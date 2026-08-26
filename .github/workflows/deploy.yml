@@ -197,18 +197,63 @@ jobs:
       # The commit is passed explicitly rather than letting the server take
       # whatever origin/master points at, so a push that lands while this runs
       # cannot slip an untested commit into the deploy.
+      # Breaks a bootstrap deadlock, and is otherwise a no-op.
+      #
+      # The remote-repair logic lives in scripts/deploy.sh — but that file is on
+      # the server, and the server gets new versions of it by fetching from the
+      # repository, which is the thing that is broken. So a server whose remote
+      # has stopped working can never receive the fix that would repair it.
+      #
+      # This step runs from the runner instead, over the SSH connection that
+      # already works. It only rewrites a remote that cannot fetch, so a private
+      # repo using an SSH deploy key is untouched.
+      - name: Make sure the server can reach the repository
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        run: |
+          ssh -p "${VPS_PORT:-22}" \
+              -o BatchMode=yes \
+              -o ConnectTimeout=15 \
+              "$VPS_USER@$VPS_HOST" \
+              "set -e
+               cd /opt/als-backend
+               current=\$(git remote get-url origin)
+               if git fetch --quiet origin 2>/dev/null; then
+                 echo \"remote is fine: \$current\"
+               else
+                 echo \"remote \$current cannot fetch — repointing at $REPO_URL\"
+                 git remote set-url origin '$REPO_URL'
+                 git fetch --quiet origin
+                 echo 'repaired.'
+               fi"
+
       - name: Deploy
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
           GIT_SHA: ${{ github.sha }}
+          # The repository this run belongs to, as an anonymous-clonable URL.
+          #
+          # Passed so the server deploys from whatever repo actually ran these
+          # tests, rather than from whatever it was cloned from months ago. It
+          # is only used as a fallback when the configured remote fails, so a
+          # private repo with a working SSH deploy key is left alone —
+          # see "Reconciling the remote" in scripts/deploy.sh.
+          #
+          # This also self-heals a rename or a transfer between owners, which
+          # is otherwise a silent breakage: git follows GitHub's redirect for a
+          # while and then stops.
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
         run: |
           ssh -p "${VPS_PORT:-22}" \
               -o BatchMode=yes \
               -o ConnectTimeout=15 \
               "$VPS_USER@$VPS_HOST" \
-              "bash /opt/als-backend/scripts/deploy.sh '$GIT_SHA'"
+              "bash /opt/als-backend/scripts/deploy.sh '$GIT_SHA' '$REPO_URL'"
 
       # Closes the loop. `deploy.sh` succeeding means the process restarted, not
       # that it can serve — a bad DATABASE_URL or a missing JWT_SECRET in

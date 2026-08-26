@@ -2,17 +2,21 @@
 # Server-side deploy. Run over SSH by .github/workflows/deploy.yml, never by
 # hand in normal operation.
 #
-#     scripts/deploy.sh <commit-sha>
+#     scripts/deploy.sh <commit-sha> [repo-url]
 #
 # Deploys an exact commit rather than "whatever origin/master is now", so a push
 # that lands mid-deploy cannot ship a commit that was never tested.
+#
+# `repo-url` is the repository the workflow ran in. It is only used if the
+# configured remote cannot be fetched — see "Reconciling the remote" below.
 set -euo pipefail
 
 APP_DIR=/opt/als-backend
 HEALTH_URL=http://127.0.0.1:8000/health
 SERVICE=als-backend
 
-TARGET_SHA="${1:?usage: deploy.sh <commit-sha>}"
+TARGET_SHA="${1:?usage: deploy.sh <commit-sha> [repo-url]}"
+EXPECTED_REPO="${2:-}"
 
 cd "$APP_DIR"
 
@@ -20,7 +24,65 @@ cd "$APP_DIR"
 PREVIOUS_SHA="$(git rev-parse HEAD)"
 echo "==> current $PREVIOUS_SHA -> target $TARGET_SHA"
 
-git fetch --quiet origin
+# --- Reconciling the remote ---------------------------------------------------
+#
+# The remote configured at provision time can stop working without anything on
+# this box changing. Two ways it has actually happened:
+#
+#   · The clone used an SSH URL (git@github.com:...), which needs a key
+#     registered with GitHub. The key provision.sh generates is for the opposite
+#     direction — GitHub Actions into this server — so `git fetch` fails with
+#     "Permission denied (publickey)" that names github.com, not this host.
+#
+#   · The repository was renamed or transferred to another owner. Git follows
+#     GitHub's redirect for a while, and then one day does not.
+#
+# So: try what is configured, and only if that fails fall back to the URL the
+# workflow passed — which is by definition the repository that just ran the
+# tests. Rewriting unconditionally would break a private repo that is correctly
+# using an SSH deploy key.
+REMOTE_URL="$(git remote get-url origin 2>/dev/null || echo '(none)')"
+echo "==> fetching from $REMOTE_URL"
+
+if ! git fetch --quiet origin 2>/tmp/als-deploy-fetch.log; then
+    sed 's/^/    /' /tmp/als-deploy-fetch.log >&2
+
+    if [ -z "$EXPECTED_REPO" ]; then
+        echo "!! could not fetch from $REMOTE_URL, and no fallback URL was given." >&2
+        echo "!! if this is an SSH remote on a public repository, switch it:" >&2
+        echo "!!     git -C $APP_DIR remote set-url origin \\" >&2
+        echo "!!         \"\$(git -C $APP_DIR remote get-url origin \\" >&2
+        echo "!!           | sed -e 's#^git@github\\.com:#https://github.com/#')\"" >&2
+        exit 1
+    fi
+
+    echo "==> that failed; falling back to $EXPECTED_REPO" >&2
+    git remote set-url origin "$EXPECTED_REPO"
+
+    if ! git fetch --quiet origin 2>/tmp/als-deploy-fetch.log; then
+        sed 's/^/    /' /tmp/als-deploy-fetch.log >&2
+        echo "!! could not fetch from $EXPECTED_REPO either." >&2
+        echo "!! a private repository needs a read-only deploy key on this server:" >&2
+        echo "!!     sudo -u als ssh-keygen -t ed25519 -N '' -f /home/als/.ssh/github_deploy" >&2
+        echo "!!     cat /home/als/.ssh/github_deploy.pub" >&2
+        echo "!! add that to the repo's Settings > Deploy keys, then point the" >&2
+        echo "!! remote back at the git@github.com: form." >&2
+        exit 1
+    fi
+
+    echo "==> remote repaired: origin is now $EXPECTED_REPO"
+fi
+
+# The commit has to exist after the fetch. Without this the `git reset` below
+# fails with git's own terse message, which reads like a corrupt repository
+# rather than "CI deployed a commit this remote does not have".
+if ! git cat-file -e "${TARGET_SHA}^{commit}" 2>/dev/null; then
+    echo "!! $TARGET_SHA is not in $(git remote get-url origin) after fetching." >&2
+    echo "!! nothing has been changed. This usually means the workflow and this" >&2
+    echo "!! server are pointed at different repositories." >&2
+    exit 1
+fi
+
 git reset --hard --quiet "$TARGET_SHA"
 
 echo "==> installing dependencies"

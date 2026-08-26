@@ -16,30 +16,47 @@ Two properties, and they pull in opposite directions:
 
 import asyncio
 
-import pytest
-
 from app.workers.runner import Worker
 
 
 class _Clock:
-    """Records what the loop slept for, without actually sleeping."""
+    """Records what the loop slept for, instead of actually sleeping."""
 
     def __init__(self) -> None:
         self.waits: list[float] = []
 
-    async def sleep(self, worker: Worker, seconds: float) -> None:
-        self.waits.append(seconds)
-        # Yield, so a concurrent `stop()` gets a turn.
+
+def _install(monkeypatch, clock: _Clock, tick, *, stop_after: int):
+    """
+    Replace the loop's two moving parts and bound the run.
+
+    `_sleep` is patched with a plain function, not a bound method: assigning
+    `clock.sleep` to the class would leave it already bound to the clock, so
+    `worker._sleep(5)` would pass 5 as `worker` and never reach `seconds`.
+
+    The tick stops the worker after a fixed number of passes rather than the
+    test racing it with `asyncio.sleep(0)`. That also removes the hang the first
+    version of this file had: a tick that always reports work and never awaits
+    anything real never yields, so a stop set from outside is never seen.
+    """
+    calls = {"count": 0}
+
+    async def counted_tick(self, client):
+        calls["count"] += 1
+        if calls["count"] >= stop_after:
+            self.stop()
+        # A real tick always awaits a query or a download. Without a yield here
+        # the loop spins without ever handing control back.
+        await asyncio.sleep(0)
+        return await tick(self, client)
+
+    async def fake_sleep(self, seconds):
+        clock.waits.append(seconds)
         await asyncio.sleep(0)
 
-
-async def _run_briefly(worker: Worker, ticks: int) -> None:
-    """Let the loop run for a bounded number of passes, then stop it."""
-    task = asyncio.create_task(worker.run())
-    for _ in range(ticks * 4):
-        await asyncio.sleep(0)
-    worker.stop()
-    await asyncio.wait_for(task, timeout=5)
+    monkeypatch.setattr(Worker, "_tick", counted_tick)
+    monkeypatch.setattr(Worker, "_sleep", fake_sleep)
+    return calls
 
 
 async def test_a_failing_pass_does_not_kill_the_loop(monkeypatch):
@@ -48,36 +65,34 @@ async def test_a_failing_pass_does_not_kill_the_loop(monkeypatch):
 
     A database that has gone away, a Supabase blip, a malformed row — any of
     them raising out of `_tick` must be one bad pass, not the end of the worker.
+    This is exactly what a local run does with no Postgres, and the loop is
+    expected to log and carry on rather than exit.
     """
-    calls = {"count": 0}
     clock = _Clock()
 
-    async def failing_tick(self, client):
-        calls["count"] += 1
+    async def failing(self, client):
         raise RuntimeError("the database went away")
 
-    monkeypatch.setattr(Worker, "_tick", failing_tick)
-    monkeypatch.setattr(Worker, "_sleep", clock.sleep)
+    calls = _install(monkeypatch, clock, failing, stop_after=3)
 
     worker = Worker()
-    await _run_briefly(worker, ticks=3)
+    await asyncio.wait_for(worker.run(), timeout=5)
 
-    assert calls["count"] > 1, "the loop gave up after the first failure"
-    # And it backed off rather than spinning at full speed on a dead database.
-    assert all(wait >= 30 for wait in clock.waits), clock.waits
+    assert calls["count"] >= 3, "the loop gave up after the first failure"
+    # And it backed off rather than hammering a dead database.
+    assert clock.waits and all(wait >= 30 for wait in clock.waits), clock.waits
 
 
 async def test_an_empty_queue_idles_rather_than_spinning(monkeypatch):
     clock = _Clock()
 
-    async def empty_tick(self, client):
+    async def empty(self, client):
         return False
 
-    monkeypatch.setattr(Worker, "_tick", empty_tick)
-    monkeypatch.setattr(Worker, "_sleep", clock.sleep)
+    _install(monkeypatch, clock, empty, stop_after=2)
 
     worker = Worker()
-    await _run_briefly(worker, ticks=2)
+    await asyncio.wait_for(worker.run(), timeout=5)
 
     assert clock.waits, "an empty queue should sleep"
     assert all(wait <= 10 for wait in clock.waits), "idle waits should be short"
@@ -86,19 +101,16 @@ async def test_an_empty_queue_idles_rather_than_spinning(monkeypatch):
 async def test_work_found_means_no_sleep(monkeypatch):
     """A full queue is drained back to back, not one document every five seconds."""
     clock = _Clock()
-    calls = {"count": 0}
 
-    async def busy_tick(self, client):
-        calls["count"] += 1
+    async def busy(self, client):
         return True
 
-    monkeypatch.setattr(Worker, "_tick", busy_tick)
-    monkeypatch.setattr(Worker, "_sleep", clock.sleep)
+    calls = _install(monkeypatch, clock, busy, stop_after=3)
 
     worker = Worker()
-    await _run_briefly(worker, ticks=3)
+    await asyncio.wait_for(worker.run(), timeout=5)
 
-    assert calls["count"] > 1
+    assert calls["count"] >= 3
     assert clock.waits == [], "a worker with work to do should not be sleeping"
 
 

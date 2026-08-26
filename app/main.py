@@ -1,14 +1,19 @@
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI
+import structlog
+from fastapi import FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.errors import install_exception_handlers
 from app.core.logging import RequestContextMiddleware, configure_logging
-from app.db.session import dispose_engine
+from app.db.session import dispose_engine, engine
+
+log = structlog.get_logger()
 
 DESCRIPTION = """
 Ardena Learning System.
@@ -37,7 +42,26 @@ async def lifespan(app: FastAPI):
     way an async service degrades over hours rather than failing outright.
     """
     configure_logging()
+
+    # Refuses only on the unsafe things — a default signing secret, DEBUG in
+    # production. See app/core/config.py for why the missing-integration case
+    # is a warning instead.
     settings.assert_production_ready()
+
+    for missing in settings.unavailable_features():
+        # `warning`, not `info`: these are the answers to support questions
+        # that otherwise cost an afternoon, and they should be greppable in the
+        # first screen of a container's logs.
+        log.warning("feature_unavailable", detail=missing)
+
+    log.info(
+        "started",
+        environment=settings.environment,
+        payments=settings.payments_configured,
+        storage=settings.storage_configured,
+        sms=settings.sms_configured,
+        google_sign_in=bool(settings.google_client_ids),
+    )
 
     app.state.http = httpx.AsyncClient(
         timeout=httpx.Timeout(settings.http_timeout_seconds),
@@ -86,6 +110,35 @@ def create_app() -> FastAPI:
         Readiness is a separate concern and gets its own endpoint later.
         """
         return {"status": "ok", "environment": settings.environment}
+
+    @app.get("/ready", tags=["ops"], summary="Readiness")
+    async def ready() -> JSONResponse:
+        """
+        Whether this process can actually serve — which means the database.
+
+        Separate from ``/health`` on purpose. Liveness must not touch Postgres:
+        a probe that does restarts every container the moment the database
+        hiccups, turning a brief blip into an outage. Readiness is the opposite
+        question — "should traffic come here right now" — and for that the
+        database is exactly the thing to check.
+
+        Deliberately says nothing about which integrations are configured. A
+        deploy gate only needs to know whether to send traffic, and publishing
+        the shape of the environment to anyone who asks is not worth the
+        convenience. The admin console's Operations page has that, behind a
+        login.
+        """
+        try:
+            async with engine.connect() as connection:
+                await connection.execute(text("SELECT 1"))
+        except Exception:
+            log.warning("readiness_database_unreachable")
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"status": "unavailable", "database": False},
+            )
+
+        return JSONResponse(content={"status": "ready", "database": True})
 
     return app
 

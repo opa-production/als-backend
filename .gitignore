@@ -18,3 +18,15 @@ venv/
 *.egg-info/
 build/
 dist/
+
+# The admin console.
+#
+# Lives here on disk for convenience — it is developed against this API and the
+# two move together — but it is a separate front end with its own repository.
+# Keeping it out of this one means the backend's history stays about the
+# backend, and a `git log` is not half npm lockfile churn.
+#
+#   cd admin && git init
+#
+# Its origin has to appear in this service's CORS_ORIGINS either way.
+/admin/

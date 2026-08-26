@@ -97,6 +97,20 @@ class SupabaseStorage:
         self._client = client
         self._base = settings.supabase_url.rstrip("/")
 
+    def _assert_configured(self) -> None:
+        """
+        Fails with a sentence rather than a puzzle.
+
+        Without this, an unset ``SUPABASE_URL`` leaves ``_base`` empty and every
+        call goes to a relative path — httpx rejects it with a
+        ``UnsupportedProtocol`` that names neither Supabase nor the missing
+        variable, and the student sees "something went wrong on our side".
+        """
+        if not settings.storage_configured:
+            raise StorageError(
+                "File storage is not configured on this server yet."
+            )
+
     @property
     def _headers(self) -> dict[str, str]:
         return {
@@ -106,6 +120,7 @@ class SupabaseStorage:
 
     async def signed_upload_url(self, bucket: Bucket, path: str) -> SignedUpload:
         """A short-lived URL the client uploads to. Overwrites are rejected."""
+        self._assert_configured()
         response = await self._client.post(
             f"{self._base}/storage/v1/object/upload/sign/{bucket}/{path}",
             headers=self._headers,
@@ -129,6 +144,7 @@ class SupabaseStorage:
         The TTL is short by default and the URL is minted per request, so a
         link pasted into a group chat stops working long before it spreads.
         """
+        self._assert_configured()
         ttl = ttl_seconds or settings.supabase_storage_signed_url_ttl
         response = await self._client.post(
             f"{self._base}/storage/v1/object/sign/{bucket}/{path}",
@@ -147,6 +163,7 @@ class SupabaseStorage:
         Called when a material is *hard* deleted, never on a soft delete — a
         tombstoned row still has to be able to come back.
         """
+        self._assert_configured()
         if not paths:
             return
 

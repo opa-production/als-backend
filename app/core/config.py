@@ -196,29 +196,89 @@ class Settings(BaseSettings):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
         return value
 
-    def assert_production_ready(self) -> None:
-        """
-        Called at startup. Refuses to serve production traffic with a default
-        secret — the one misconfiguration that is silent, permanent and
-        catastrophic.
-        """
+    # --- Startup checks ---------------------------------------------------
+    #
+    # Two lists, and the line between them is the whole point.
+    #
+    # A *fatal* misconfiguration makes serving unsafe for everyone: a default
+    # signing secret means anyone can mint a token for any account. There is no
+    # degraded mode for that, so the process refuses to start and someone
+    # notices while they are still watching the deploy.
+    #
+    # A *missing integration* makes one feature unavailable. Storage keys,
+    # payment keys, an SMS provider — without them `/materials/*`, `/billing/*`
+    # and real OTP delivery each report themselves unconfigured, and everything
+    # else works exactly as it should. Refusing to boot over those would take
+    # the whole product down to protect a part of it, which is the wrong trade
+    # every time: a student cannot read their notes because nobody has pasted a
+    # Kora key yet.
+
+    def fatal_misconfigurations(self) -> list[str]:
+        """Reasons this process must not serve traffic at all."""
         if not self.is_production:
-            return
+            return []
 
         problems: list[str] = []
         if self.jwt_secret == "change-me-in-every-environment":
-            problems.append("JWT_SECRET is still the default")
-        if not self.storage_configured:
-            problems.append("Supabase storage is not configured")
-        if not self.payments_configured:
-            problems.append("KORA_SECRET_KEY is not set — nothing can be sold")
-        if not self.public_base_url:
             problems.append(
-                "PUBLIC_BASE_URL is not set — Kora would have nowhere to send webhooks"
+                "JWT_SECRET is still the default — every token in the system "
+                "would be forgeable"
             )
         if self.debug:
-            problems.append("DEBUG is on")
+            problems.append("DEBUG is on, which leaks internals in error responses")
 
+        return problems
+
+    def unavailable_features(self) -> list[str]:
+        """
+        Features that will report themselves unconfigured, in plain words.
+
+        Logged at startup and surfaced on the admin console's Operations page,
+        so "why can nobody upload a PDF" has an answer that does not require
+        reading the environment by hand.
+        """
+        missing: list[str] = []
+
+        if not self.storage_configured:
+            missing.append(
+                "SUPABASE_URL / SUPABASE_SERVICE_KEY are not set — uploads and "
+                "downloads under /materials will be refused"
+            )
+        if not self.payments_configured:
+            missing.append(
+                "KORA_SECRET_KEY is not set — /billing/checkout and "
+                "/billing/verify will report that payments are unavailable"
+            )
+        elif not self.public_base_url:
+            # Only worth saying once payments are on: without a public origin
+            # Kora is given no notification_url, so a charge succeeds and
+            # nothing here is ever told about it.
+            missing.append(
+                "PUBLIC_BASE_URL is not set — Kora charges will carry no webhook "
+                "address, so payments will need reconciling by hand"
+            )
+        if not self.sms_configured:
+            missing.append(
+                "SMS_API_KEY / SMS_PARTNER_ID are not set — sign-in codes are "
+                "written to the log instead of sent"
+            )
+        if not self.google_client_ids:
+            missing.append("GOOGLE_CLIENT_IDS is not set — /auth/google will refuse")
+        if self.is_production and not self.cors_origins:
+            missing.append(
+                "CORS_ORIGINS is empty — the admin console will be blocked by the "
+                "browser before its requests reach this service"
+            )
+
+        return missing
+
+    def assert_production_ready(self) -> None:
+        """
+        Called at startup. Raises only on the things that make serving unsafe.
+
+        Everything else is a warning: see `unavailable_features`.
+        """
+        problems = self.fatal_misconfigurations()
         if problems:
             raise RuntimeError("Refusing to start: " + "; ".join(problems))
 

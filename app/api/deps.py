@@ -6,10 +6,11 @@ from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import AppError
-from app.core.security import decode_access_token
+from app.core.errors import AppError, Forbidden
+from app.core.security import decode_access_token, decode_admin_token
 from app.db.session import get_session
 from app.models.account import User
+from app.models.admin import AdminUser
 
 #: ``auto_error=False`` so a missing header reaches the handler below and comes
 #: back in the app's ``{"message": ...}`` shape, rather than FastAPI's own
@@ -102,3 +103,94 @@ async def get_device_id(
         return uuid.UUID(claims["did"])
     except ValueError:
         return None
+
+
+# --- Admin console -----------------------------------------------------------
+
+
+async def get_current_admin(
+    session: DbSession,
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Depends(bearer_scheme)
+    ] = None,
+) -> AdminUser:
+    """
+    The admin behind the bearer token.
+
+    ``decode_admin_token`` refuses a student's access token even though it
+    carries a valid signature — same secret, different ``typ``. Without that
+    check every student in the system would be an administrator.
+
+    The row is loaded fresh, so deactivating an account takes effect on the
+    next request rather than whenever the token happens to expire.
+    """
+    unauthorised = AppError("Admin sign-in required.", status_code=401)
+
+    if credentials is None or not credentials.credentials:
+        raise unauthorised
+
+    claims = decode_admin_token(credentials.credentials)
+    if claims is None:
+        raise unauthorised
+
+    try:
+        admin_id = uuid.UUID(claims["sub"])
+    except (KeyError, ValueError):
+        raise unauthorised from None
+
+    admin = await session.get(AdminUser, admin_id)
+    if admin is None or not admin.is_active:
+        raise unauthorised
+
+    return admin
+
+
+CurrentAdmin = Annotated[AdminUser, Depends(get_current_admin)]
+
+#: Who may do what.
+#:
+#: Three roles, because two is not enough and four is a permissions system
+#: nobody asked for. Support answers tickets and can move one student's
+#: account; admin can see and change money; owner can create other admins.
+ROLE_RANK = {"support": 1, "admin": 2, "owner": 3}
+
+
+def require_role(minimum: str):
+    """
+    A dependency that refuses anyone below ``minimum``.
+
+    Ranked rather than a set of named permissions: the roles here are strictly
+    nested — everything support can do, admin can — and a rank comparison
+    cannot develop the gaps a hand-maintained permission matrix does.
+    """
+    floor = ROLE_RANK[minimum]
+
+    async def _guard(admin: CurrentAdmin) -> AdminUser:
+        if ROLE_RANK.get(admin.role, 0) < floor:
+            raise Forbidden("Your admin role does not allow that.")
+        return admin
+
+    return _guard
+
+
+#: Reads money and changes entitlement.
+AdminRole = Annotated[AdminUser, Depends(require_role("admin"))]
+#: Creates and removes other admins.
+OwnerRole = Annotated[AdminUser, Depends(require_role("owner"))]
+
+
+async def client_ip(request: Request) -> str | None:
+    """
+    Best-effort caller address, for the audit log only.
+
+    ``X-Forwarded-For`` is trusted because nginx sits in front and sets it (see
+    ``deploy/``), and it is never used for a decision — only recorded, so that
+    a login someone does not recognise has something attached to it.
+    """
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else None
+
+
+ClientIp = Annotated[str | None, Depends(client_ip)]

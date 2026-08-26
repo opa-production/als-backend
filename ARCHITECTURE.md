@@ -166,10 +166,13 @@ app/
   api/
     deps.py          Auth, pagination, db session dependencies
     v1/router.py     Aggregates route modules
-    v1/routes/       One module per resource (empty for now)
+    v1/routes/       One module per resource
+    v1/routes/admin/ The console — its own auth, its own token type (§7)
   services/
     storage.py       Supabase Storage adapter, signed URLs
     quota.py         Plan limits, enforced server-side
+    analytics.py     Every number the console shows, computed live
+    audit.py         Appends an admin action, in the caller's transaction
   workers/           Background jobs: PDF text, OCR, embeddings
 ```
 
@@ -179,7 +182,109 @@ authorise, delegate, and shape a response.
 
 ---
 
-## 7. What is deliberately not here yet
+## 7. The admin console
+
+`/api/v1/admin/*`. Same process, same database, deliberately separate identity.
+
+### Why a second table and not a flag
+
+`admin_users` is its own table rather than `users.is_admin`, for three reasons
+that each stand alone:
+
+- **The credential is different.** A student signs in with an SMS code to a
+  Kenyan number; an admin signs in from a laptop with a password. A password
+  column on `users` is a hashable secret on ten thousand rows that will never
+  have one.
+- **The token is different.** Admin tokens carry `typ: admin` and are refused
+  by every student endpoint; student tokens are refused by every admin one.
+  Both are signed with the same secret, so `typ` is the whole separation — see
+  `decode_admin_token` in `app/core/security.py`. With one table and a boolean,
+  a stolen student token plus a flipped flag is total access.
+- **Blast radius.** Nothing under `/admin` is scoped to one account.
+
+Passwords use `hashlib.scrypt` — a memory-hard KDF from the standard library,
+rather than adding passlib and a C extension for a table that holds single
+digits of rows. Parameters are stored with each digest so they can be raised
+later without invalidating existing passwords.
+
+### Roles
+
+Three, ranked and strictly nested: `support` < `admin` < `owner`. A rank
+comparison rather than a permission matrix, because the roles genuinely nest
+and a matrix develops gaps.
+
+| Role | Can |
+| --- | --- |
+| `support` | Read everything. Release a device lock — the one privileged action that grants nothing. |
+| `admin` | Grant and revoke plans, reset usage counters, reconcile payments, delete and restore accounts. |
+| `owner` | Create, change and remove other admins. |
+
+The role is read from the row on every request, never from the token. A
+demotion takes effect immediately rather than at the next sign-in.
+
+### The audit log
+
+`admin_audit_log` is appended in the same transaction as the change it
+describes, so it cannot record an action that was rolled back. Reads are not
+logged — logging them buries the twenty entries that matter under twenty
+thousand that do not. The one exception is a successful sign-in, because "who
+was in, from where" is the first question anyone asks afterwards.
+
+Nothing in the API deletes or edits an entry, and `admin_id` is `ON DELETE SET
+NULL` with the email denormalised alongside it, so removing an administrator
+does not anonymise what they did.
+
+### Where the numbers come from
+
+`app/services/analytics.py`, computed live from the same tables the product
+writes. No rollup table and no nightly job: an aggregate is faster and is also
+a second copy of the truth that goes wrong quietly, and quietly-wrong revenue
+is worth a few hundred milliseconds to avoid.
+
+Two definitions are used consistently:
+
+- **Active** — `expires_at` in the future *and* `verified`. The same test
+  `app/services/quota.py` applies before letting anyone spend a quota, so the
+  console cannot claim someone is paying while the API refuses them.
+- **Paying** — active *and* on a tier that costs money.
+
+The Friends plan is the one place arithmetic goes wrong by default: one payment
+of KES 1,250 creates up to five subscriptions on `tier = friends`, so MRR is
+counted **per group** while seats are counted per person. Both numbers are
+correct and they answer different questions.
+
+### The endpoint that matters most
+
+`POST /admin/payments/{reference}/reconcile`. Webhooks are delivered over the
+internet: a student pays, Paystack fires, the request is dropped or a container
+is mid-deploy, and the money is real while the subscription is not. Nothing
+notices — the student is charged and locked out, and the first signal is a
+complaint. This re-reads Paystack's own record and re-runs the same activation
+path the webhook would have, idempotently.
+
+`GET /admin/overview` surfaces the same problem as an `attention` item before
+anyone opens a ticket.
+
+### Bootstrapping
+
+There is no sign-up and no seeded account. The first administrator is created
+at a shell:
+
+```
+python scripts/create_admin.py --email you@ardena.co.ke --role owner
+```
+
+A default password baked into a migration is a back door that ships to every
+environment and is remembered in none of them.
+
+Login is rate limited in nginx rather than in the application (`deploy/nginx.conf`),
+because the limit has to reject a request before it costs a worker — the KDF is
+deliberately slow, which makes an unthrottled login form a way to occupy the
+whole pool.
+
+---
+
+## 8. What is deliberately not here yet
 
 - No endpoints. The next task.
 - No LLM adapter. `/tutor/ask` receives passages the device already ranked, so

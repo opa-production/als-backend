@@ -9,6 +9,7 @@ cheerfully generate a migration to *drop*.
 
 from app.db.base import Base
 from app.models.account import Device, User
+from app.models.admin import AdminAuditLog, AdminRefreshToken, AdminUser
 from app.models.auth import OtpCode, RefreshToken
 from app.models.billing import (
     Payment,
@@ -25,6 +26,9 @@ from app.models.trial import TrialGrant
 from app.models.tutor import Chat, Message
 
 __all__ = [
+    "AdminAuditLog",
+    "AdminRefreshToken",
+    "AdminUser",
     "Base",
     "ClassSession",
     "Chat",

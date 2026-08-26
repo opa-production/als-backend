@@ -70,6 +70,36 @@ do — reading a PDF, running OCR.
 
 ---
 
+## The back office
+
+Not on the three tiers above, because it depends on nothing outside this
+service and blocks nothing inside it. It is `/api/v1/admin/*` — see
+ARCHITECTURE.md §7 for why it has its own identity table and its own token
+type.
+
+| Group | Endpoints |
+| --- | --- |
+| Auth | `POST /admin/auth/login`, `/refresh`, `/logout`, `GET /admin/auth/me` |
+| Overview | `GET /admin/overview`, `/overview/timeseries`, `/overview/institutions` |
+| Users | `GET /admin/users`, `GET|PATCH|DELETE /admin/users/{id}`, `POST /{id}/restore`, `POST|DELETE /{id}/subscription`, `POST /{id}/device-reset`, `GET /{id}/usage`, `POST /{id}/usage/reset`, `GET /{id}/groups` |
+| Subscriptions | `GET /admin/subscriptions`, `/subscriptions/stats` |
+| Revenue | `GET /admin/revenue/summary`, `/by-plan`, `/timeseries`, `/top-customers` |
+| Payments | `GET /admin/payments`, `/payments/{id}`, `POST /payments/{reference}/reconcile` |
+| Groups | `GET /admin/groups`, `/groups/{id}` |
+| Content | `GET /admin/content/stats`, `/content/materials` |
+| Ops | `GET /admin/ops/health`, `/ops/plans` |
+| Audit | `GET /admin/audit`, `/audit/actions` |
+| Admins | `GET|POST /admin/admins`, `PATCH|DELETE /admin/admins/{id}`, `GET /{id}/sessions` |
+
+**Status: implemented.** Bootstrap the first account with
+`python scripts/create_admin.py --email you@ardena.co.ke --role owner`.
+
+The one piece here that is not a read: `POST /admin/payments/{reference}/reconcile`
+re-reads Paystack and applies the answer, which is how a payment whose webhook
+never arrived gets credited without anyone editing a row by hand.
+
+---
+
 ## The rule that keeps the order honest
 
 An endpoint moves up a tier the moment it needs a credential nobody has set

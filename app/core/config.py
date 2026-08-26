@@ -76,6 +76,12 @@ class Settings(BaseSettings):
     jwt_access_ttl_minutes: int = 30
     jwt_refresh_ttl_days: int = 60
 
+    # --- Admin console ----------------------------------------------------
+    #: Shorter than a student's. A console session left open on a laptop is a
+    #: different risk from an app on a phone that is already locked.
+    admin_access_ttl_minutes: int = 60
+    admin_refresh_ttl_days: int = 7
+
     # --- Supabase Storage -------------------------------------------------
     supabase_url: str = ""
     supabase_service_key: str = ""

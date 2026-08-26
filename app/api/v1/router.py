@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from app.api.v1.routes import auth, billing, materials, me, settings, sync
+from app.api.v1.routes.admin import admin_router
 
 api_router = APIRouter()
 
@@ -11,6 +12,12 @@ api_router.include_router(settings.router, prefix="/me", tags=["account"])
 api_router.include_router(sync.router, prefix="/sync", tags=["sync"])
 api_router.include_router(materials.router, prefix="/materials", tags=["knowledge"])
 api_router.include_router(billing.router, prefix="/billing", tags=["billing"])
+
+# The console. Its own auth, its own token type, its own audience — see
+# app/api/v1/routes/admin/__init__.py. Mounted last because nothing else
+# depends on it and because a route table reads better with the product
+# above the back office.
+api_router.include_router(admin_router, prefix="/admin")
 
 # Still to come — the complex tier, per ROADMAP.md.
 #

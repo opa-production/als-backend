@@ -107,3 +107,127 @@ def create_otp() -> tuple[str, str]:
 def verify_otp(code: str, code_hash: str) -> bool:
     """Constant-time, so timing cannot leak how much of a guess was right."""
     return hmac.compare_digest(hash_token(code), code_hash)
+
+
+# --- Admin credentials -------------------------------------------------------
+#
+# Admins have a password; students never do. Everything below is only reachable
+# from ``/api/v1/admin``.
+
+ADMIN_TOKEN = "admin"
+
+#: scrypt from the standard library, rather than bcrypt or argon2 from a
+#: dependency. It is a memory-hard KDF in the same family, it is what `hashlib`
+#: already ships, and the alternative is adding passlib plus a C extension to
+#: this service for a table that will hold single digits of rows.
+#:
+#: n=2**15, r=8, p=1 costs roughly 100ms and 32MB per verification — deliberate,
+#: since the whole point of a KDF is to be slow, and nobody logs into an admin
+#: console in a loop.
+_SCRYPT_N = 2**15
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+_SCRYPT_SALT_BYTES = 16
+_SCRYPT_DK_LEN = 32
+
+#: OpenSSL refuses a scrypt call that would allocate more than its own
+#: ``maxmem``, which defaults to exactly 32MB — and n=2**15, r=8 needs
+#: 128 * n * r = 32MB plus working space. Without this the KDF raises
+#: "memory limit exceeded" rather than being slow, which is a very confusing
+#: way for a login to fail.
+_SCRYPT_MAXMEM = 64 * 1024 * 1024
+
+
+def hash_password(password: str) -> str:
+    """
+    ``scrypt$n$r$p$salt$hash``, salt and parameters carried with the digest.
+
+    Storing the parameters means they can be raised later without invalidating
+    every existing password — an old hash still says how to verify itself.
+    """
+    salt = secrets.token_bytes(_SCRYPT_SALT_BYTES)
+    digest = hashlib.scrypt(
+        password.encode(),
+        salt=salt,
+        n=_SCRYPT_N,
+        r=_SCRYPT_R,
+        p=_SCRYPT_P,
+        dklen=_SCRYPT_DK_LEN,
+        maxmem=_SCRYPT_MAXMEM,
+    )
+    return "$".join(
+        (
+            "scrypt",
+            str(_SCRYPT_N),
+            str(_SCRYPT_R),
+            str(_SCRYPT_P),
+            salt.hex(),
+            digest.hex(),
+        )
+    )
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    """Constant-time, and False rather than an exception on a malformed hash."""
+    try:
+        scheme, n, r, p, salt_hex, digest_hex = encoded.split("$")
+        if scheme != "scrypt":
+            return False
+        candidate = hashlib.scrypt(
+            password.encode(),
+            salt=bytes.fromhex(salt_hex),
+            n=int(n),
+            r=int(r),
+            p=int(p),
+            dklen=len(bytes.fromhex(digest_hex)),
+            maxmem=_SCRYPT_MAXMEM,
+        )
+    except (ValueError, TypeError, MemoryError):
+        return False
+
+    return hmac.compare_digest(candidate.hex(), digest_hex)
+
+
+def create_admin_token(admin_id: uuid.UUID) -> str:
+    """
+    Short-lived, and carries no role.
+
+    The role is read from the row on every request. A role baked into a token
+    means a demotion does not take effect until the token expires, which is the
+    wrong direction for the one credential that can grant paid plans.
+    """
+    issued = _now()
+    payload: dict[str, Any] = {
+        "sub": str(admin_id),
+        "typ": ADMIN_TOKEN,
+        "iat": int(issued.timestamp()),
+        "exp": int(
+            (issued + timedelta(minutes=settings.admin_access_ttl_minutes)).timestamp()
+        ),
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+def decode_admin_token(token: str) -> dict[str, Any] | None:
+    """
+    Returns the claims, or None.
+
+    The ``typ`` check is the whole point of this being a separate function: a
+    student's access token is signed with the same secret and would otherwise
+    verify perfectly here.
+    """
+    try:
+        claims = jwt.decode(
+            token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
+        )
+    except JWTError:
+        return None
+
+    if claims.get("typ") != ADMIN_TOKEN:
+        return None
+
+    return claims
+
+
+def admin_refresh_expiry() -> datetime:
+    return _now() + timedelta(days=settings.admin_refresh_ttl_days)

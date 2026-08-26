@@ -202,6 +202,47 @@ if [ ! -x .venv/bin/pip ]; then
         fi
     fi
 
+    # Last resort, and it works without root.
+    #
+    # `--without-pip` never calls ensurepip, so it succeeds on exactly the box
+    # that has just failed above: the venv module itself is in the standard
+    # library, and Debian only strips *ensurepip* out into the separate
+    # python3.x-venv package. So the environment can be built, and pip put into
+    # it afterwards by PyPA's own installer.
+    #
+    # That is not a new trust boundary. The very next thing this script does is
+    # `pip install .`, which downloads and executes setup code from PyPI —
+    # get-pip.py comes from the same project, over the same TLS.
+    #
+    # Deliberately noisy. It leaves the server in a working state but still
+    # misconfigured, and a silent workaround is one nobody ever goes back and
+    # fixes.
+    if [ -z "$created" ]; then
+        for candidate in $tried; do
+            rm -rf .venv
+            "$candidate" -m venv --without-pip .venv 2> /dev/null || continue
+
+            if curl --fail --silent --show-error --max-time 30 \
+                https://bootstrap.pypa.io/get-pip.py -o /tmp/als-get-pip.py &&
+                .venv/bin/python /tmp/als-get-pip.py --quiet; then
+                echo ""
+                echo "!! ---------------------------------------------------------"
+                echo "!! This server is missing ${candidate}-venv."
+                echo "!!"
+                echo "!! The deploy worked around it by building the environment"
+                echo "!! without pip and installing pip separately. That is slower"
+                echo "!! on every deploy and depends on reaching pypa.io."
+                echo "!!"
+                echo "!! Fix it properly, once, as root:"
+                echo "!!     sudo apt-get install -y ${candidate}-venv"
+                echo "!! ---------------------------------------------------------"
+                echo ""
+                created=1
+                break
+            fi
+        done
+    fi
+
     if [ -z "$created" ]; then
         rm -rf .venv
         echo "" >&2

@@ -274,8 +274,83 @@ echo "==> alembic upgrade head"
 # process instantly. See the note in alembic/script.py.mako.
 .venv/bin/alembic upgrade head
 
+# --- Restarting without root --------------------------------------------------
+#
+# The clean path is `sudo systemctl restart`, which provision.sh grants this
+# account for exactly one unit. On a box where that sudoers rule was never
+# written, the deploy would otherwise stop here having already installed the new
+# code and run the migrations — everything done except the one step that makes
+# any of it take effect.
+#
+# So there is a second route, and it is safe only under conditions this checks
+# rather than assumes:
+#
+#   · Restart=always — systemd will bring the service straight back. Under any
+#     other policy, signalling the process would simply take production down,
+#     which is far worse than a failed deploy.
+#   · User= matches whoever is running this, so the process is ours to signal.
+#     `kill` on a root-owned process would fail anyway; checking first means the
+#     reason is stated rather than discovered.
+#   · A real MainPID, so the unit is actually running.
+#
+# Reading unit properties needs no privileges; only acting on them does.
+restart_service() {
+    if sudo -n /bin/systemctl restart "$SERVICE" 2> /tmp/als-restart.log; then
+        return 0
+    fi
+
+    sed 's/^/    /' /tmp/als-restart.log >&2
+    echo "==> no sudo rule for restarting $SERVICE -- trying a signal instead"
+
+    local policy main_pid unit_user
+    policy="$(systemctl show "$SERVICE" -p Restart --value 2> /dev/null || true)"
+    main_pid="$(systemctl show "$SERVICE" -p MainPID --value 2> /dev/null || echo 0)"
+    unit_user="$(systemctl show "$SERVICE" -p User --value 2> /dev/null || true)"
+
+    if [ "$policy" != "always" ]; then
+        echo "!! $SERVICE has Restart=${policy:-unset}, so signalling it would" >&2
+        echo "!! stop the service rather than restart it. Not doing that." >&2
+        return 1
+    fi
+
+    if [ "${main_pid:-0}" -le 0 ]; then
+        echo "!! $SERVICE is not running, so there is nothing to signal." >&2
+        return 1
+    fi
+
+    if [ "$unit_user" != "$(id -un)" ]; then
+        echo "!! $SERVICE runs as ${unit_user:-root}, not $(id -un)." >&2
+        return 1
+    fi
+
+    echo "==> Restart=always and the process is ours -- signalling pid $main_pid"
+    # SIGTERM, not SIGKILL: the unit sets TimeoutStopSec=30 so in-flight
+    # requests get to finish, and Restart=always brings it back after
+    # RestartSec. The health loop below is what confirms it actually did.
+    kill -TERM "$main_pid" 2> /dev/null || return 1
+    return 0
+}
+
 echo "==> restarting $SERVICE"
-sudo /bin/systemctl restart "$SERVICE"
+if ! restart_service; then
+    echo "" >&2
+    echo "!! The new code is installed and the migrations have run, but the" >&2
+    echo "!! service is still serving the old build." >&2
+    echo "" >&2
+    echo "!! Finish provisioning this box once, as root. It is idempotent --" >&2
+    echo "!! it will not re-clone, overwrite /etc/als-backend/env, or replace" >&2
+    echo "!! the CI key:" >&2
+    echo "" >&2
+    echo "!!     sudo bash $APP_DIR/scripts/provision.sh \\" >&2
+    echo "!!       --repo ${EXPECTED_REPO:-<repo url>} \\" >&2
+    echo "!!       --domain <your domain>" >&2
+    echo "" >&2
+    echo "!! Or just the two pieces this box is missing:" >&2
+    echo "!!     sudo apt-get install -y python3.12-venv" >&2
+    echo "!!     echo '$(id -un) ALL=(root) NOPASSWD: /bin/systemctl restart $SERVICE' \\" >&2
+    echo "!!       | sudo tee /etc/sudoers.d/$SERVICE && sudo chmod 440 /etc/sudoers.d/$SERVICE" >&2
+    exit 1
+fi
 
 # A restart that "succeeded" tells you systemd forked a process, not that the
 # app can serve. Without this gate a deploy that dies on a bad env var goes
@@ -297,7 +372,7 @@ git reset --hard --quiet "$PREVIOUS_SHA"
 # dangerous than a failed deploy. Migrations here are additive, so the old code
 # runs fine against the new schema. Un-pick the migration by hand if it is the
 # thing that broke.
-sudo /bin/systemctl restart "$SERVICE"
+restart_service
 
 echo "!! rolled back. Inspect with: journalctl -u $SERVICE -n 100 --no-pager" >&2
 exit 1

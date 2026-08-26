@@ -127,6 +127,22 @@ async def _attention(session: AsyncSession) -> list[AttentionItem]:
     return items
 
 
+@router.get(
+    "/notifications",
+    response_model=list[AttentionItem],
+    summary="Everything that wants a person",
+)
+async def notifications(session: DbSession) -> list[AttentionItem]:
+    """
+    The same list the dashboard used to carry as banners.
+
+    Given its own endpoint so the notifications screen does not have to fetch
+    the whole overview — which computes revenue, the plan breakdown and the
+    funnel — to render five lines.
+    """
+    return await _attention(session)
+
+
 @router.get("/overview", response_model=OverviewOut, summary="Dashboard")
 async def overview(session: DbSession) -> OverviewOut:
     """

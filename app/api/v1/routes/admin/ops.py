@@ -82,6 +82,17 @@ async def health(session: DbSession) -> OpsHealthOut:
             "hour for extraction — the worker may be down."
         )
 
+    ai = await analytics.ai_health(session)
+
+    # Surfaced as a warning too, not just a number on a card. A wedged worker is
+    # invisible from every other screen — students simply get no answers about
+    # documents they can see sitting in their library.
+    if ai.failed:
+        warnings.append(
+            f"{ai.failed} documents failed text extraction and cannot be quoted "
+            "by the tutor."
+        )
+
     return OpsHealthOut(
         environment=settings.environment,
         database_ok=database_ok,
@@ -89,6 +100,7 @@ async def health(session: DbSession) -> OpsHealthOut:
         integrations=integrations,
         counts=counts,
         warnings=warnings,
+        ai=ai,
     )
 
 

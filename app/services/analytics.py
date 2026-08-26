@@ -626,6 +626,119 @@ async def content_stats(session: AsyncSession) -> ContentStats:
     )
 
 
+# --- The tutor pipeline -------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AiHealth:
+    """
+    Whether the tutor could answer well, if it were being asked.
+
+    Reports the *pipeline*, not a model. There is no LLM adapter yet — see
+    ROADMAP.md — so anything claiming to measure inference latency here would be
+    inventing it. What is genuinely knowable is whether the material a tutor
+    would have to quote from has been read, chunked and made searchable, and
+    that is what decides answer quality long before the model does.
+
+    ``coverage_pct`` is the number to watch. A tutor that cites pages can only
+    cite pages it has extracted; every failed extraction is a document a student
+    can see in their library and get no answers from.
+    """
+
+    #: Whether /tutor/ask is served at all.
+    tutor_available: bool
+    #: Why not, when it is not. Empty when it is.
+    tutor_status: str
+
+    extractable: int
+    extracted: int
+    pending: int
+    failed: int
+    stalled: int
+    coverage_pct: float
+
+    chunks: int
+    chunks_per_material: float
+
+    answers_30d: int
+    prompt_tokens_30d: int
+    completion_tokens_30d: int
+    avg_tokens_per_answer: int
+
+
+async def ai_health(session: AsyncSession) -> AiHealth:
+    now = utc_now()
+    since_30d = now - timedelta(days=30)
+    live = Material.deleted_at.is_(None)
+
+    # `note` and `link` carry their text already and are never extracted, so
+    # counting them would dilute coverage with documents that need no work.
+    extractable_filter = (live, Material.kind.in_(("pdf", "image")))
+
+    extractable = await count_rows(session, Material, *extractable_filter)
+    extracted = await count_rows(
+        session, Material, *extractable_filter, Material.extraction_status == "done"
+    )
+    pending = await count_rows(
+        session,
+        Material,
+        *extractable_filter,
+        Material.extraction_status.in_(("pending", "running")),
+    )
+    failed = await count_rows(
+        session, Material, *extractable_filter, Material.extraction_status == "failed"
+    )
+    stalled = await count_rows(
+        session,
+        Material,
+        *extractable_filter,
+        Material.extraction_status == "pending",
+        Material.created_at < now - timedelta(hours=1),
+    )
+
+    chunks = await count_rows(session, MaterialChunk)
+
+    answers = await count_rows(
+        session, Message, Message.role == "tutor", Message.created_at >= since_30d
+    )
+    tokens = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(Message.prompt_tokens), 0),
+                func.coalesce(func.sum(Message.completion_tokens), 0),
+            ).where(Message.created_at >= since_30d)
+        )
+    ).one()
+
+    prompt_tokens = int(tokens[0] or 0)
+    completion_tokens = int(tokens[1] or 0)
+
+    return AiHealth(
+        # Flipped on when app/api/v1/routes/tutor.py exists and is mounted.
+        # Stated rather than guessed: a console that implies a working tutor
+        # sends support chasing a model that was never wired up.
+        tutor_available=False,
+        tutor_status=(
+            "Not served yet. /tutor/ask needs the extraction pipeline first — "
+            "an answer that cites a page needs the page to have been read."
+        ),
+        extractable=extractable,
+        extracted=extracted,
+        pending=pending,
+        failed=failed,
+        stalled=stalled,
+        coverage_pct=round(extracted / extractable * 100, 1) if extractable else 0.0,
+        chunks=chunks,
+        chunks_per_material=round(chunks / extracted, 1) if extracted else 0.0,
+        answers_30d=answers,
+        prompt_tokens_30d=prompt_tokens,
+        completion_tokens_30d=completion_tokens,
+        avg_tokens_per_answer=(
+            int((prompt_tokens + completion_tokens) / answers) if answers else 0
+        ),
+    )
+
+
 # --- One student, in full ----------------------------------------------------
 
 

@@ -160,15 +160,65 @@ if [ ! -x .venv/bin/pip ]; then
         echo "==> no virtualenv -- creating one"
     fi
 
-    # Matches provision.sh. The fallback matters on a box where 3.12 is the
-    # system python and the versioned name was never installed.
-    VENV_PYTHON=python3.12
-    command -v "$VENV_PYTHON" > /dev/null 2>&1 || VENV_PYTHON=python3
+    # Every interpreter on the box gets a turn, rather than one guess.
+    #
+    # On Debian and Ubuntu, `python3.12 -m venv` fails when python3.12-venv is
+    # not installed — the interpreter is present, `command -v` finds it, and the
+    # failure only appears when ensurepip is actually needed. So the presence of
+    # a python says nothing about whether it can build a venv, and the only way
+    # to find out is to try.
+    #
+    # 3.12 first because provision.sh installs it and pyproject requires >= 3.12;
+    # then whatever `python3` points at; then 3.13 for a newer box.
+    created=""
+    tried=""
 
-    if ! "$VENV_PYTHON" -m venv .venv; then
-        echo "!! could not create a virtualenv with $VENV_PYTHON." >&2
-        echo "!! the venv module is packaged separately on Debian and Ubuntu:" >&2
-        echo "!!     sudo apt-get install -y ${VENV_PYTHON}-venv" >&2
+    for candidate in python3.12 python3 python3.13; do
+        command -v "$candidate" > /dev/null 2>&1 || continue
+        case " $tried " in *" $candidate "*) continue ;; esac
+        tried="$tried $candidate"
+
+        rm -rf .venv
+        if "$candidate" -m venv .venv 2> /tmp/als-venv.log; then
+            echo "==> virtualenv created with $candidate"
+            created=1
+            break
+        fi
+
+        echo "==> $candidate could not build one:"
+        sed 's/^/    /' /tmp/als-venv.log >&2
+    done
+
+    # `virtualenv` carries its own copy of pip and so does not need ensurepip.
+    # Where it happens to be installed it walks straight past the problem above.
+    if [ -z "$created" ] && command -v virtualenv > /dev/null 2>&1; then
+        echo "==> falling back to virtualenv, which bundles its own pip"
+        rm -rf .venv
+        if virtualenv --quiet --python=python3.12 .venv 2> /tmp/als-venv.log ||
+            virtualenv --quiet .venv 2> /tmp/als-venv.log; then
+            created=1
+        else
+            sed 's/^/    /' /tmp/als-venv.log >&2
+        fi
+    fi
+
+    if [ -z "$created" ]; then
+        rm -rf .venv
+        echo "" >&2
+        echo "!! no interpreter on this server can build a virtualenv." >&2
+        echo "!! tried:$tried" >&2
+        echo "" >&2
+        echo "!! On Debian and Ubuntu the venv module is a separate package." >&2
+        echo "!! Install it once, as root, then re-run this deploy:" >&2
+        echo "" >&2
+        for candidate in $tried; do
+            echo "!!     sudo apt-get install -y ${candidate}-venv" >&2
+        done
+        echo "" >&2
+        # Said plainly because it looks like a gap in the automation and is not.
+        echo "!! This deploy cannot install it itself, by design: the deploy" >&2
+        echo "!! account's sudo is limited to restarting one service, so that a" >&2
+        echo "!! leaked CI key is not equivalent to root. See provision.sh." >&2
         exit 1
     fi
 fi

@@ -440,6 +440,31 @@ class AdminMaterialRow(BaseModel):
 # --- Ops ---------------------------------------------------------------------
 
 
+class AiHealthOut(FromDataclass):
+    """
+    The tutor pipeline. Not a model — see `ai_health` in analytics.py for why
+    this reports extraction coverage rather than inference latency.
+    """
+
+    tutor_available: bool
+    tutor_status: str
+
+    extractable: int
+    extracted: int
+    pending: int
+    failed: int
+    stalled: int
+    coverage_pct: float
+
+    chunks: int
+    chunks_per_material: float
+
+    answers_30d: int
+    prompt_tokens_30d: int
+    completion_tokens_30d: int
+    avg_tokens_per_answer: int
+
+
 class OpsHealthOut(BaseModel):
     environment: str
     database_ok: bool
@@ -450,6 +475,7 @@ class OpsHealthOut(BaseModel):
     integrations: dict[str, bool]
     counts: dict[str, int]
     warnings: list[str]
+    ai: AiHealthOut
 
 
 # --- Audit -------------------------------------------------------------------

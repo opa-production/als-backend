@@ -26,6 +26,7 @@ APP_DIR=/opt/als-backend
 ENV_DIR=/etc/als-backend
 ENV_FILE="$ENV_DIR/env"
 SERVICE=als-backend
+WORKER=als-worker
 PYTHON=python3.12
 
 DOMAIN=""
@@ -194,10 +195,14 @@ chown root:root "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
 
-say "installing the systemd unit"
+say "installing the systemd units"
 install -m 644 "$APP_DIR/deploy/als-backend.service" "/etc/systemd/system/$SERVICE.service"
+# The extraction worker. A separate process because PDF parsing is CPU-bound
+# and would otherwise stall every request sharing the API's event loop.
+install -m 644 "$APP_DIR/deploy/als-worker.service" "/etc/systemd/system/$WORKER.service"
 systemctl daemon-reload
 systemctl enable "$SERVICE" > /dev/null
+systemctl enable "$WORKER" > /dev/null
 
 
 say "granting $APP_USER permission to restart the service"

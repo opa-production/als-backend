@@ -177,6 +177,53 @@ class Settings(BaseSettings):
             return ""
         return f"{self.public_base_url.rstrip('/')}/api/v1/billing/webhook"
 
+    # --- The tutor --------------------------------------------------------
+    #
+    # One key per provider. A provider with no key is *listed* by /tutor/models
+    # and reported unavailable, rather than hidden — the app shows the full
+    # line-up with the ones you cannot pick yet greyed out, and adding a key is
+    # the only thing that turns one on.
+    deepseek_api_key: str = ""
+    openai_api_key: str = ""
+    anthropic_api_key: str = ""
+    google_api_key: str = ""
+
+    #: What a student gets when they express no preference.
+    ai_default_model: str = "deepseek-chat"
+
+    #: Long enough for a full explanation, short enough that a runaway
+    #: generation cannot bill for a novel.
+    ai_max_output_tokens: int = 900
+
+    #: Low, not zero. Coursework answers should be steady rather than
+    #: inventive, but zero makes a model repeat itself almost word for word
+    #: when a student rephrases the same question.
+    ai_temperature: float = 0.3
+
+    #: Separate from HTTP_TIMEOUT_SECONDS, which is 15s and right for Kora and
+    #: Supabase. A model streaming 900 tokens routinely takes longer than that,
+    #: and killing it at 15s would look like the tutor failing at random.
+    ai_timeout_seconds: float = 120.0
+
+    #: How many passages go into the prompt. Beyond about six, the useful ones
+    #: get lost among the rest and the answer starts drifting.
+    ai_retrieval_top_k: int = 6
+
+    #: Below this, the student's own material is treated as not containing the
+    #: answer, and the tutor says so before answering from general knowledge.
+    #: The whole "I could not find this in your notes" behaviour turns on this
+    #: number, so it is here rather than buried in the retrieval code.
+    ai_retrieval_min_score: float = 0.04
+
+    @property
+    def tutor_configured(self) -> bool:
+        return bool(
+            self.deepseek_api_key
+            or self.openai_api_key
+            or self.anthropic_api_key
+            or self.google_api_key
+        )
+
     # --- Outbound ---------------------------------------------------------
     #: Every outbound call gets a deadline. A hung upstream must fail in
     #: seconds rather than hold a worker until the container is killed.
@@ -264,6 +311,11 @@ class Settings(BaseSettings):
             )
         if not self.google_client_ids:
             missing.append("GOOGLE_CLIENT_IDS is not set — /auth/google will refuse")
+        if not self.tutor_configured:
+            missing.append(
+                "no AI provider key is set (DEEPSEEK_API_KEY and friends) — "
+                "/tutor/ask will refuse and the app's tutor will be unavailable"
+            )
         if self.is_production and not self.cors_origins:
             missing.append(
                 "CORS_ORIGINS is empty — the admin console will be blocked by the "

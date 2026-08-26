@@ -120,9 +120,24 @@ def test_a_fully_configured_production_warns_about_nothing():
         sms_partner_id="p",
         google_client_ids=["client-id"],
         cors_origins=["https://admin.ardena.xyz"],
+        deepseek_api_key="sk-live",
     )
 
     assert settings.unavailable_features() == []
+
+
+def test_a_missing_ai_key_is_a_warning_not_a_refusal():
+    """
+    The tutor is a feature, not the product.
+
+    Without a provider key /tutor/ask refuses and every other screen — notes,
+    timetable, sync, billing — carries on exactly as before. Refusing to boot
+    over it would take the whole thing down to protect one endpoint.
+    """
+    settings = _production(deepseek_api_key="")
+
+    assert settings.fatal_misconfigurations() == []
+    assert any("AI provider" in warning for warning in settings.unavailable_features())
 
 
 def test_a_missing_public_base_url_is_only_flagged_once_payments_are_on():

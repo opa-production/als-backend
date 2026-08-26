@@ -17,10 +17,14 @@ dependencies = [
   "alembic>=1.14",
   "pydantic>=2.9",
   "pydantic-settings>=2.6",
-  # One shared async client for Supabase and Paystack.
+  # One shared async client for Supabase, Kora and the AI providers.
   "httpx>=0.27",
   "python-jose[cryptography]>=3.3",
   "structlog>=24.4",
+  # PDF text extraction, in the worker. Pure Python — no compiled extension to
+  # fail on a box that has no build toolchain, and none to be blocked by a
+  # Windows code-signing policy either, which is what ruled LangChain out.
+  "pypdf>=5.1",
 ]
 
 [project.optional-dependencies]
@@ -34,6 +38,9 @@ dev = [
   # has a system tz database; Windows does not, and `alembic revision` there
   # dies with "Can't locate timezone: UTC" until this is installed.
   "tzdata>=2024.2",
+  # Builds the PDFs the extraction tests read. Test-only: nothing in the
+  # service ever writes a PDF.
+  "reportlab>=4.0",
 ]
 
 # `app` is the only importable package. Without this, setuptools tries to

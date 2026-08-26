@@ -14,6 +14,10 @@ set -euo pipefail
 APP_DIR=/opt/als-backend
 HEALTH_URL=http://127.0.0.1:8000/health
 SERVICE=als-backend
+#: Restarted alongside the API so a deploy does not leave an old worker
+#: parsing with last release's code. Failing to restart it is not fatal — the
+#: API is what serves students.
+WORKER=als-worker
 
 # --- Running from an immutable copy -------------------------------------------
 #
@@ -294,6 +298,19 @@ echo "==> alembic upgrade head"
 #   · A real MainPID, so the unit is actually running.
 #
 # Reading unit properties needs no privileges; only acting on them does.
+restart_worker() {
+    # Best effort, and never fatal. The worker only reads a queue: an old one
+    # left running parses with last release's code, which is a stale extraction
+    # rather than a broken product. The API is what students talk to, and
+    # failing a deploy that successfully shipped it would be the wrong trade.
+    if sudo -n /bin/systemctl restart "$WORKER" 2> /dev/null; then
+        echo "==> restarted $WORKER"
+    else
+        echo "==> could not restart $WORKER (not fatal; it will pick up the new"
+        echo "    code at its next restart)"
+    fi
+}
+
 restart_service() {
     if sudo -n /bin/systemctl restart "$SERVICE" 2> /tmp/als-restart.log; then
         return 0
@@ -359,6 +376,7 @@ echo "==> waiting for health"
 for attempt in $(seq 1 30); do
     if curl --fail --silent --max-time 2 "$HEALTH_URL" > /dev/null; then
         echo "==> healthy after ${attempt}s"
+        restart_worker
         echo "==> deployed $TARGET_SHA"
         exit 0
     fi

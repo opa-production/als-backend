@@ -1,0 +1,62 @@
+# systemd unit for the ALS extraction worker. Installed to /etc/systemd/system/
+# by scripts/provision.sh.
+#
+# A separate process from the API, deliberately: PDF parsing is CPU-bound, and
+# a handler that blocks the event loop stalls every other request on that
+# process. See ARCHITECTURE.md §3.
+
+[Unit]
+Description=ALS extraction worker
+After=network-online.target
+Wants=network-online.target
+# Not Requires=: the worker is useful on its own and the API is useful without
+# it. Tying them together would mean restarting one bounces the other.
+After=als-backend.service
+
+[Service]
+Type=exec
+User=als
+Group=als
+WorkingDirectory=/opt/als-backend
+
+# The same secrets file as the API. It needs the database and Supabase; it
+# never touches Kora or the AI keys.
+EnvironmentFile=/etc/als-backend/env
+
+ExecStart=/opt/als-backend/.venv/bin/python -m app.workers.runner
+
+# The worker checks for shutdown between documents, so a clean stop takes at
+# most one document's parse. Ninety seconds is generous for the largest file
+# the plans allow.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+Restart=always
+RestartSec=5
+
+# One CPU-bound process should not be able to starve the API on a small box.
+# A soft cap rather than a hard one: it slows the worker down under contention
+# instead of killing it mid-document.
+CPUWeight=50
+MemoryMax=512M
+
+# Hardening, matching the API's. The worker needs its own directory and the
+# network and nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+ReadWritePaths=/opt/als-backend
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=als-worker
+
+[Install]
+WantedBy=multi-user.target

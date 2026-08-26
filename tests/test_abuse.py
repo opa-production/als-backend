@@ -191,7 +191,7 @@ async def test_an_expired_account_can_still_read_its_own_work(client):
 async def test_an_unverified_paid_plan_grants_nothing(client):
     """
     The app writes a subscription optimistically when a student says they
-    paid. Until Paystack confirms it, that is a claim — and a claim that
+    paid. Until Kora confirms it, that is a claim — and a claim that
     unlocked the product would make the payment optional.
     """
     _, user_id = await sign_in(client)

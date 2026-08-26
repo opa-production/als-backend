@@ -12,7 +12,10 @@ from app.core.errors import AppError, Forbidden, NotFound
 from app.models.account import User
 from app.models.billing import PlanGroup, PlanGroupMember
 from app.services import billing as billing_service
-from app.services.paystack import (
+from app.services.kora import (
+    SUCCESS,
+    build_metadata,
+    charge_from_data,
     initialize_transaction,
     new_reference,
     verify_signature,
@@ -56,6 +59,13 @@ class CheckoutRequest(BaseModel):
 
 class CheckoutOut(BaseModel):
     #: Open this in a browser. It is single-use and belongs to one student.
+    checkout_url: str
+    #: The same URL under its old name.
+    #:
+    #: Kept for one release because a build already on a student's phone reads
+    #: this field, and an app that cannot find it shows a dead Upgrade button
+    #: with no way to fix it short of the store. Remove once the deployed
+    #: clients are past the version that reads `checkout_url`.
     authorization_url: str
     #: Hand this back to /billing/verify when the browser closes.
     reference: str
@@ -65,7 +75,7 @@ class CheckoutOut(BaseModel):
 
 
 class VerifyRequest(BaseModel):
-    reference: str = Field(max_length=120, description="Paystack transaction reference.")
+    reference: str = Field(max_length=120, description="Kora transaction reference.")
 
 
 class GroupOut(BaseModel):
@@ -117,7 +127,7 @@ async def read_subscription(user: CurrentUser, session: DbSession) -> Subscripti
 
     An expired plan reports as `trial` rather than as the tier that was bought,
     because that is what the limits actually are. `verified` is false when a
-    payment has not been confirmed by Paystack — the app writes that optimistically
+    payment has not been confirmed by Kora — the app writes that optimistically
     and this is where it gets reconciled.
     """
     entitlement = await get_entitlement(session, user.id)
@@ -149,14 +159,14 @@ async def start_checkout(
     http: HttpClient,
 ) -> CheckoutOut:
     """
-    Opens a Paystack page for this student and this plan.
+    Opens a Kora checkout for this student and this plan.
 
-    The app used to ship three fixed ``paystack.shop/pay/...`` links. Those
-    work, but they are the same page for everyone: the charge that comes back
-    names no account, so the only thread tying it to a student is the email
-    they happened to type — and most sign in with a phone number and never
-    have one. Everything downstream then has to guess, and
-    ``assert_charge_belongs_to`` was left refusing honest payments.
+    A fixed, shareable payment link cannot do this. Such a link is the same page
+    for everyone: the charge that comes back names no account, so the only
+    thread tying it to a student is the email they happened to type — and most
+    sign in with a phone number and never have one. Everything downstream then
+    has to guess, and ``assert_charge_belongs_to`` is left refusing honest
+    payments.
 
     Here the price comes from the server's own plan table and the metadata is
     written from the caller's token, so the charge arrives already knowing who
@@ -177,24 +187,23 @@ async def start_checkout(
     checkout = await initialize_transaction(
         http,
         email=billing_service.receipt_email(user),
+        name=user.full_name or "ALS student",
         # From the plan table, never from the request. A price the client
         # sends is a price the client can choose.
+        #
+        # Sent in shillings, not cents: Kora charges the major unit. The
+        # Paystack integration this replaced multiplied by 100 here, and
+        # leaving that in would bill KES 35,000 for a KES 350 plan.
         amount_kes=plan.price_ksh,
         reference=new_reference(),
-        metadata={
-            "user_id": str(user.id),
-            "tier": tier.value,
-            # Shown on the Paystack dashboard beside the charge, which is
-            # where anyone reconciling a payment actually looks.
-            "custom_fields": [
-                {
-                    "display_name": "Plan",
-                    "variable_name": "plan",
-                    "value": plan.name,
-                },
-            ],
-        },
-        callback_url=settings.paystack_callback_url or None,
+        # Kora caps metadata at five short-named fields and rejects the nested
+        # structure Paystack accepted, so the payload is built in one place.
+        metadata=build_metadata(
+            user_id=str(user.id), tier=tier.value, plan_name=plan.name
+        ),
+        narration=f"ALS {plan.name} — 30 days",
+        redirect_url=settings.kora_callback_url or None,
+        notification_url=settings.webhook_url or None,
     )
 
     log.info(
@@ -205,7 +214,8 @@ async def start_checkout(
     )
 
     return CheckoutOut(
-        authorization_url=checkout.authorization_url,
+        checkout_url=checkout.checkout_url,
+        authorization_url=checkout.checkout_url,
         reference=checkout.reference,
         tier=tier.value,
         plan_name=plan.name,
@@ -221,18 +231,22 @@ async def verify_payment(
     http: HttpClient,
 ) -> SubscriptionOut:
     """
-    Checks a reference with Paystack and applies the plan.
+    Checks a reference with Kora and applies the plan.
 
-    Called when the student comes back from checkout. It asks Paystack what
-    happened rather than believing the app — the device cannot see a charge, so
-    its word is a claim and this is what turns a claim into an entitlement.
+    Called when the student comes back from checkout. It asks Kora what happened
+    rather than believing the app — the device cannot see a charge, so its word
+    is a claim and this is what turns a claim into an entitlement.
 
     Safe to call repeatedly: the reference is unique, so a second call returns
     the same subscription instead of extending it again.
     """
     charge = await verify_transaction(http, payload.reference)
 
-    if charge.status != "success":
+    if charge.status != SUCCESS:
+        # Kora reports `processing` and `pending` for a charge that is still
+        # moving — an M-Pesa prompt the student has not answered yet. Saying
+        # "not gone through" is honest for all of them, and the webhook credits
+        # the plan the moment it lands.
         raise AppError("That payment has not gone through.", status_code=402)
 
     # A reference travels — receipts, screenshots, support threads. Without
@@ -260,74 +274,85 @@ async def verify_payment(
 @router.post(
     "/webhook",
     status_code=status.HTTP_200_OK,
-    summary="Paystack webhook",
+    summary="Kora webhook",
     include_in_schema=False,
 )
-async def paystack_webhook(
+async def kora_webhook(
     request: Request,
     session: DbSession,
-    x_paystack_signature: str | None = Header(default=None),
+    x_korapay_signature: str | None = Header(default=None),
 ) -> dict[str, bool]:
     """
     Where a payment becomes true.
 
     Not in the schema, because it is not for the app.
 
-    Three things make this safe. The signature is checked against the **raw
-    body** — re-serialising parsed JSON changes whitespace and breaks the
-    digest. The reference is unique, so Paystack's repeat deliveries credit the
-    plan once. And it always answers 200 on a signed request, because a
-    non-2xx makes Paystack retry for hours over something we have already
-    recorded.
+    Three things make this safe. The signature is checked before anything is
+    parsed for meaning — and it covers **only the ``data`` object**, hashed with
+    SHA-256, which is Kora's own convention and not the one Paystack used. The
+    reference is unique, so Kora's repeat deliveries credit the plan exactly
+    once. And it answers 200 to anything correctly signed, because a non-2xx
+    makes Kora retry for hours over something already recorded.
     """
     raw = await request.body()
 
-    if not verify_signature(raw, x_paystack_signature):
-        log.warning("paystack_webhook_bad_signature")
+    if not verify_signature(raw, x_korapay_signature):
+        log.warning("kora_webhook_bad_signature")
         raise Forbidden("Invalid signature.")
 
     event = await request.json()
-    if event.get("event") != "charge.success":
+    name = event.get("event")
+
+    # `charge.failed` is delivered too. It is deliberately not recorded here:
+    # the only failed charges worth a row are ones this service opened, and
+    # those already have a `pending` row from checkout that the admin reconcile
+    # endpoint can settle against Kora's own record.
+    if name != "charge.success":
+        log.info("kora_webhook_ignored", event=name)
         return {"received": True}
 
     data = event.get("data") or {}
-    metadata = data.get("metadata") or {}
+    charge = charge_from_data(data)
 
-    user_id = metadata.get("user_id")
+    user_id = (charge.metadata or {}).get("user_id")
     if not user_id:
-        # Nothing to credit. Logged rather than rejected: retrying will not
-        # make a user id appear.
-        log.error("paystack_webhook_no_user", reference=data.get("reference"))
+        # Nothing to credit. Logged rather than rejected: retrying will not make
+        # a user id appear, and a 4xx here would have Kora redelivering for
+        # hours over a payment nobody can attribute.
+        log.error("kora_webhook_no_user", reference=charge.reference)
         return {"received": True}
 
-    from app.services.paystack import Charge
-
-    charge = Charge(
-        reference=data.get("reference", ""),
-        status=data.get("status", "failed"),
-        amount_kes=int(data.get("amount", 0)) // 100,
-        channel=data.get("channel", ""),
-        email=(data.get("customer") or {}).get("email", ""),
-        metadata=metadata,
-    )
+    try:
+        owner = uuid.UUID(str(user_id))
+    except ValueError:
+        log.error("kora_webhook_bad_user", reference=charge.reference, user_id=user_id)
+        return {"received": True}
 
     try:
         tier = billing_service.tier_from_charge(charge)
     except AppError:
-        log.error("paystack_webhook_unknown_tier", reference=charge.reference)
+        log.error(
+            "kora_webhook_unknown_tier",
+            reference=charge.reference,
+            amount=charge.amount_kes,
+        )
         return {"received": True}
 
     _, is_new = await billing_service.record_payment(
-        session, user_id=uuid.UUID(user_id), charge=charge, tier=tier
+        session, user_id=owner, charge=charge, tier=tier
     )
 
-    if is_new and charge.status == "success":
-        await billing_service.activate(
-            session, user_id=uuid.UUID(user_id), tier=tier, verified=True
-        )
+    if is_new and charge.status == SUCCESS:
+        await billing_service.activate(session, user_id=owner, tier=tier, verified=True)
         if tier is Tier.FRIENDS:
-            await billing_service.create_group(session, owner_id=uuid.UUID(user_id))
+            await billing_service.create_group(session, owner_id=owner)
 
+    log.info(
+        "kora_webhook_applied",
+        reference=charge.reference,
+        tier=tier.value,
+        first_delivery=is_new,
+    )
     return {"received": True}
 
 

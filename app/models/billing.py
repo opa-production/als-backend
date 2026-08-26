@@ -46,7 +46,7 @@ class Subscription(Base, UUIDPrimaryKey, Timestamps):
         DateTime(timezone=True), nullable=True
     )
 
-    #: False until a Paystack webhook has confirmed the money. The app already
+    #: False until a Kora webhook has confirmed the money. The app already
     #: writes unverified subscriptions when a student says they paid, so this
     #: is the column that reconciles those against reality.
     verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -118,7 +118,7 @@ class PlanGroupMember(Base, UUIDPrimaryKey, Timestamps):
 
 class Payment(Base, UUIDPrimaryKey, Timestamps):
     """
-    A Paystack transaction, as Paystack described it.
+    A Kora transaction, as Kora described it.
 
     Nothing here is a card number. The reference and the status are all a
     webhook gives us and all we have any business keeping.
@@ -130,7 +130,7 @@ class Payment(Base, UUIDPrimaryKey, Timestamps):
         ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
     )
 
-    #: Paystack's reference, unique so a webhook delivered three times — which
+    #: Kora's reference, unique so a webhook delivered three times — which
     #: it will be — credits the plan exactly once.
     reference: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
 

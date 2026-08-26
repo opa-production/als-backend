@@ -1,0 +1,138 @@
+/*
+ * Design tokens.
+ *
+ * Every colour, radius and shadow in the console resolves to something in this
+ * file. Nothing else hard-codes a hex value — which is what makes "make the
+ * sidebar green" a one-line change rather than a search across forty files.
+ *
+ * Three rules this palette holds to:
+ *
+ *   1. The content plane is white. Cards are separated by hairline borders,
+ *      not by tinted backgrounds, so the page reads as one sheet of paper.
+ *   2. No gradients anywhere. Every surface is a flat fill. Depth comes from
+ *      borders and one very soft shadow on floating layers only.
+ *   3. The chart colours are validated, not chosen by eye. See the block at
+ *      the bottom — those hexes passed a colour-blindness and contrast check
+ *      against this exact white surface, and re-picking them by taste breaks
+ *      that guarantee.
+ */
+
+:root {
+  color-scheme: light;
+
+  /* --- The coloured panel ------------------------------------------------
+   *
+   * The one saturated surface in the product. `--sidebar` is deliberately the
+   * first token in the file: it is the knob to turn when the brand colour
+   * changes, and the four values under it are steps of the same hue, so they
+   * move together.
+   */
+  --sidebar: #152a4e;
+  --sidebar-hover: #1e3a66;
+  --sidebar-active: #24457a;
+  --sidebar-line: #24406e;
+  --sidebar-ink: #ffffff;
+  --sidebar-ink-2: #a9bad8;
+  --sidebar-ink-3: #7189b1;
+  /* The 3px bar on the active nav row. Lighter than the panel so it reads as
+   * lit rather than as a hole punched in it. */
+  --sidebar-accent: #5b9bff;
+
+  /* --- Content plane ---------------------------------------------------- */
+  --bg: #ffffff;
+  /* Table headers, hover rows, code. Barely off-white on purpose: enough to
+   * separate a header band from its rows, not enough to look like a panel. */
+  --bg-subtle: #f7f8fa;
+  --bg-sunken: #f2f4f7;
+
+  --border: #e5e8ec;
+  --border-strong: #d3d8df;
+
+  --text: #0f1729;
+  --text-2: #4a5567;
+  --text-3: #8792a6;
+
+  /* --- Primary ----------------------------------------------------------
+   *
+   * Darker than the chart blue below, because this one carries text and
+   * needs 4.5:1 on white; the chart blue only has to carry a mark.
+   */
+  --primary: #1c5cab;
+  --primary-hover: #174c8e;
+  --primary-soft: #ebf2fc;
+  --primary-ring: rgba(28, 92, 171, 0.16);
+
+  /* --- Status -----------------------------------------------------------
+   *
+   * Each state is a trio: a saturated dot, dark text, and a flat tint behind
+   * both. The dot is what makes the state legible to someone who cannot
+   * separate the tints — status is never carried by colour alone, it always
+   * ships with an icon or a word.
+   */
+  --good: #0ca30c;
+  --good-text: #046a31;
+  --good-bg: #e8f6ec;
+
+  --warn: #fab219;
+  --warn-text: #8a5a00;
+  --warn-bg: #fef4e2;
+
+  --danger: #d03b3b;
+  --danger-text: #9b1c1c;
+  --danger-bg: #fcebeb;
+
+  --info: #2a78d6;
+  --info-text: #1c5cab;
+  --info-bg: #ebf2fc;
+
+  --neutral: #8792a6;
+  --neutral-text: #4a5567;
+  --neutral-bg: #f2f4f7;
+
+  /* --- Charts -----------------------------------------------------------
+   *
+   * Validated against this white surface for colour-blind separation and
+   * contrast (OKLab ΔE ≥ 8 under deutan/protan/tritan simulation, ≥ 15 for
+   * normal vision). Three categorical slots is the documented ceiling for
+   * charts where any two colours can end up adjacent; a fourth series folds
+   * into "Other" rather than getting a generated hue.
+   *
+   * `--series-3` sits below 3:1 against white, so anything drawn in it must
+   * carry a visible label or appear in a table too. Both places it is used
+   * do.
+   */
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+
+  /* One hue, light to dark, for ordered stages — the funnel. A ramp is only
+   * ever used where the categories genuinely have an order; colouring
+   * unordered things darker-where-bigger double-encodes the bar length and
+   * wastes the only free channel a chart has. */
+  --ramp-1: #86b6ef;
+  --ramp-2: #5598e7;
+  --ramp-3: #2a78d6;
+  --ramp-4: #1c5cab;
+  --ramp-5: #104281;
+
+  /* Chart chrome. One step off the surface and solid — a dashed gridline
+   * reads as a threshold or a projection when it is just a grid. */
+  --grid: #edeff3;
+  --axis: #d3d8df;
+
+  /* --- Geometry --------------------------------------------------------- */
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --radius-pill: 999px;
+
+  /* Only floating layers get a shadow. Cards use a border. */
+  --shadow-pop: 0 1px 2px rgba(15, 23, 41, 0.04), 0 8px 24px rgba(15, 23, 41, 0.08);
+  --shadow-modal: 0 12px 48px rgba(15, 23, 41, 0.18);
+
+  --sidebar-width: 244px;
+  --topbar-height: 60px;
+
+  --font: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}

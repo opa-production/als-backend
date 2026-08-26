@@ -546,7 +546,7 @@ async def test_ops_health_reports_unconfigured_integrations(client):
     body = response.json()
     assert body["database_ok"] is True
     assert set(body["integrations"]) == {
-        "paystack",
+        "kora",
         "supabase_storage",
         "sms",
         "google_sign_in",

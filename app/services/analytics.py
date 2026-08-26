@@ -159,7 +159,7 @@ class PlanRow:
     active: int
     #: Active and paid for. Zero for trial, by definition.
     paying: int
-    #: Written by the app on a student's word and never confirmed by Paystack.
+    #: Written by the app on a student's word and never confirmed by Kora.
     #: A non-zero number here is a reconciliation job, not a statistic.
     unverified: int
     expiring_7d: int

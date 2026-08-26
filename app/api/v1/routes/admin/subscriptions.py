@@ -49,7 +49,7 @@ async def list_subscriptions(
     the latter is what the users table is for.
 
     ``verified=false`` combined with a paid tier is the reconciliation queue:
-    every row is a student the app believes is paying and Paystack has never
+    every row is a student the app believes is paying and Kora has never
     confirmed.
     """
     now = utc_now()

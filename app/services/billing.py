@@ -19,7 +19,7 @@ from app.models.billing import (
     PlanGroupMember,
     Subscription,
 )
-from app.services.paystack import Charge
+from app.services.kora import Charge
 from app.services.plans import SELLABLE, Tier, plan_for
 from app.services.quota import new_period_end
 
@@ -39,12 +39,12 @@ def _new_invite_code() -> str:
 
 def receipt_email(user: User) -> str:
     """
-    An address to open a Paystack transaction against.
+    An address to open a Kora transaction against.
 
-    Paystack requires one on every charge; phone sign-in never collects one.
+    Kora requires one on every charge; phone sign-in never collects one.
     Rather than refuse to sell a plan to a student who signed in with a number,
     a stand-in derived from their account id is used. It is stable, so repeat
-    payments group under one Paystack customer, and it is never written to —
+    payments group under one Kora customer, and it is never written to —
     ``metadata.user_id`` is what actually identifies the payer.
     """
     if user.email:
@@ -120,7 +120,7 @@ async def record_payment(
     """
     Stores a charge, once.
 
-    Paystack delivers a webhook more than once — that is documented behaviour,
+    Kora delivers a webhook more than once — that is documented behaviour,
     not a bug — so the reference is unique and a repeat delivery returns the
     existing row. Without that, a plan gets extended by thirty days per retry.
     """
@@ -184,7 +184,7 @@ def assert_charge_belongs_to(charge: Charge, *, user_id: uuid.UUID, email: str |
     someone else's money on their own account.
 
     Metadata is the strong signal because checkout sets it from the session.
-    Email is the fallback for a payment made from a Paystack page, where the
+    Email is the fallback for a payment made from a Kora page, where the
     only thing tying the charge to a person is who they paid as.
     """
     claimed_user = (charge.metadata or {}).get("user_id")

@@ -75,7 +75,7 @@ Everything else, and specifically:
 
 ### Goes to neither
 
-Card numbers, M-Pesa PINs, anything Paystack holds. The webhook gives us a
+Card numbers, M-Pesa PINs, anything Kora holds. The webhook gives us a
 reference and a status; that is all we store.
 
 ---
@@ -86,7 +86,7 @@ reference and a status; that is all we store.
 It is worth it here because the load profile is almost entirely waiting:
 
 - Supabase Storage calls (network)
-- Paystack verification (network)
+- Kora verification (network)
 - The LLM call behind `/tutor/ask` (network, and *seconds* not milliseconds)
 - Postgres round trips
 
@@ -256,10 +256,10 @@ correct and they answer different questions.
 ### The endpoint that matters most
 
 `POST /admin/payments/{reference}/reconcile`. Webhooks are delivered over the
-internet: a student pays, Paystack fires, the request is dropped or a container
+internet: a student pays, Kora fires, the request is dropped or a container
 is mid-deploy, and the money is real while the subscription is not. Nothing
 notices — the student is charged and locked out, and the first signal is a
-complaint. This re-reads Paystack's own record and re-runs the same activation
+complaint. This re-reads Kora's own record and re-runs the same activation
 path the webhook would have, idempotently.
 
 `GET /admin/overview` surfaces the same problem as an `attention` item before

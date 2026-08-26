@@ -82,6 +82,60 @@ Without it, every CI run trusts whatever host answers on that address.
 
 ---
 
+### 3. Kora
+
+Payments run on [Kora](https://korahq.com). Two settings, both from the
+dashboard, and one thing to get right on their side.
+
+**Environment.** Copy the API keys into the service's environment:
+
+```
+KORA_SECRET_KEY=sk_live_...
+KORA_PUBLIC_KEY=pk_live_...
+PUBLIC_BASE_URL=https://als.ardena.xyz
+```
+
+`KORA_WEBHOOK_SECRET` stays blank. Kora signs webhooks with the secret key
+itself — there is no separate webhook secret to copy, unlike Paystack.
+
+`PUBLIC_BASE_URL` is not decoration. Every charge is opened with
+`notification_url` set to `{PUBLIC_BASE_URL}/api/v1/billing/webhook`, because
+the address cannot be derived from an inbound request: behind nginx the app
+only ever sees `127.0.0.1:8000`. Setting it per environment is also what stops
+a staging deploy from registering itself for production's webhooks.
+
+**Dashboard.** Set the webhook URL to the same address as a fallback, and
+enable the `charge.success` event. Nothing else is required — the charge itself
+carries the notification URL.
+
+**Check it works** once the keys are in:
+
+```bash
+curl -s https://als.ardena.xyz/api/v1/billing/plans | jq
+```
+
+Then buy something in test mode and watch for `kora_webhook_applied` in the
+logs. If you see `kora_webhook_bad_signature` instead, the signature is being
+computed over the wrong material — see below.
+
+#### Two things that differ from Paystack
+
+Both are silent when wrong, which is why they are written down rather than left
+in the code for someone to rediscover.
+
+**The amount is the major unit.** `350` means KES 350. Paystack took the minor
+unit, so the old integration multiplied by 100. Reintroducing that multiplier
+would bill KES 35,000 for a Synapse plan, and nothing in the system would
+object — the charge would simply succeed.
+
+**The webhook signature covers only the `data` object**, hashed with SHA-256
+and keyed on the secret key. Paystack signed the whole raw body with SHA-512.
+Getting this wrong does not fail loudly either: every genuine delivery is
+rejected as a forgery, payments stop being credited, and the only symptom is
+students saying they paid. `app/services/kora.py` slices the original `data`
+bytes out of the body rather than re-serialising the parsed object, because a
+round trip through Python turns `350.00` into `350.0` and changes the digest.
+
 ## Day-to-day
 
 Deploys happen on push to `master`. Nothing to run by hand.

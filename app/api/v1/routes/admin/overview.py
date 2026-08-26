@@ -48,7 +48,7 @@ async def _attention(session: AsyncSession) -> list[AttentionItem]:
                 message=(
                     f"{unverified} paid subscription"
                     f"{'' if unverified == 1 else 's'} never confirmed by "
-                    "Paystack. Each is either a lost payment or a free plan."
+                    "Kora. Each is either a lost payment or a free plan."
                 ),
                 count=unverified,
                 link="/subscriptions?verified=false",
@@ -68,7 +68,7 @@ async def _attention(session: AsyncSession) -> list[AttentionItem]:
                 code="stale_pending_payments",
                 message=(
                     f"{pending} payment{'' if pending == 1 else 's'} still "
-                    "pending after an hour. Reconcile against Paystack."
+                    "pending after an hour. Reconcile against Kora."
                 ),
                 count=pending,
                 link="/payments?status=pending",

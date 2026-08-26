@@ -29,7 +29,7 @@ async def health(session: DbSession) -> OpsHealthOut:
     empty".
 
     The integration flags matter more than they look. A dashboard showing
-    revenue while ``paystack`` is false is showing history from another
+    revenue while ``kora`` is false is showing history from another
     environment, and that is a mistake worth one row on a page rather than an
     afternoon.
     """
@@ -42,7 +42,7 @@ async def health(session: DbSession) -> OpsHealthOut:
     latency_ms = round((time.perf_counter() - started) * 1000, 2)
 
     integrations = {
-        "paystack": settings.payments_configured,
+        "kora": settings.payments_configured,
         "supabase_storage": settings.storage_configured,
         "sms": settings.sms_configured,
         "google_sign_in": bool(settings.google_client_ids),

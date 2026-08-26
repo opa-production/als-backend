@@ -18,7 +18,7 @@ from app.core.clock import now as utc_now
 from app.core.config import settings
 from app.main import app
 from app.services.billing import activate, tier_from_charge
-from app.services.paystack import Charge, verify_signature
+from app.services.kora import Charge, to_shillings, verify_signature
 from app.services.plans import Tier, plan_for
 from tests.conftest import OTHER_PHONE, sign_in
 
@@ -36,9 +36,23 @@ def _charge(amount_kes: int, *, tier: str | None = None, reference="ref_1") -> C
     )
 
 
-def _signed(body: dict) -> tuple[bytes, str]:
-    raw = json.dumps(body).encode()
-    signature = hmac.new(SECRET.encode(), raw, hashlib.sha512).hexdigest()
+def _signed(data: dict, *, event: str = "charge.success") -> tuple[bytes, str]:
+    """
+    A webhook as Kora sends one.
+
+    The signature covers **only the ``data`` object**, serialised the way
+    ``JSON.stringify`` would — no spaces. That is Kora's own convention, and it
+    is the single easiest thing to get wrong when porting from a provider that
+    signed the whole body.
+    """
+    # Built by concatenation rather than `json.dumps({...})` so the bytes on
+    # the wire and the bytes that were signed cannot drift apart. Dumping the
+    # whole body would put a space after every colon while the signed segment
+    # has none — which is a bug in the fixture, not in the verifier, and it
+    # takes a while to see that.
+    segment = json.dumps(data, separators=(",", ":"))
+    raw = f'{{"event":"{event}","data":{segment}}}'.encode()
+    signature = hmac.new(SECRET.encode(), segment.encode(), hashlib.sha256).hexdigest()
     return raw, signature
 
 
@@ -46,39 +60,95 @@ def _signed(body: dict) -> tuple[bytes, str]:
 
 
 def test_a_forged_webhook_is_rejected(monkeypatch):
-    monkeypatch.setattr(settings, "paystack_webhook_secret", SECRET)
-    raw, _ = _signed({"event": "charge.success"})
+    monkeypatch.setattr(settings, "kora_webhook_secret", SECRET)
+    raw, _ = _signed({"reference": "r"})
 
     assert verify_signature(raw, "not-the-signature") is False
     assert verify_signature(raw, None) is False
 
 
 def test_a_genuine_webhook_is_accepted(monkeypatch):
-    monkeypatch.setattr(settings, "paystack_webhook_secret", SECRET)
-    raw, signature = _signed({"event": "charge.success"})
+    monkeypatch.setattr(settings, "kora_webhook_secret", SECRET)
+    raw, signature = _signed({"reference": "r", "status": "success"})
 
     assert verify_signature(raw, signature) is True
 
 
-def test_signature_is_over_the_raw_body(monkeypatch):
+def test_the_signature_covers_only_the_data_object(monkeypatch):
     """
-    Re-serialising the parsed JSON changes whitespace, and the digest no longer
-    matches. This is why the handler reads `request.body()` rather than the
-    parsed payload.
-    """
-    monkeypatch.setattr(settings, "paystack_webhook_secret", SECRET)
-    body = {"event": "charge.success", "data": {"reference": "r"}}
-    raw, signature = _signed(body)
+    The Kora-specific rule, pinned.
 
-    reserialised = json.dumps(body, indent=2).encode()
-    assert verify_signature(reserialised, signature) is False
+    Signing the whole body is what a Paystack integration does, and it is
+    exactly what this must not do — the digest would never match and every
+    genuine delivery would be rejected as a forgery.
+    """
+    monkeypatch.setattr(settings, "kora_webhook_secret", SECRET)
+    data = {"reference": "r", "status": "success"}
+    raw, _ = _signed(data)
+
+    whole_body = hmac.new(SECRET.encode(), raw, hashlib.sha256).hexdigest()
+    assert verify_signature(raw, whole_body) is False
+
+
+def test_the_signature_survives_odd_number_formatting(monkeypatch):
+    """
+    Kora sends the amount as a decimal on some payloads.
+
+    Parsing and re-serialising in Python turns ``350.00`` into ``350.0``, which
+    changes the digest. The verifier slices the original bytes instead, so a
+    body it never re-encodes still validates.
+    """
+    monkeypatch.setattr(settings, "kora_webhook_secret", SECRET)
+
+    raw = b'{"event":"charge.success","data":{"amount":350.00,"reference":"r"}}'
+    segment = b'{"amount":350.00,"reference":"r"}'
+    signature = hmac.new(SECRET.encode(), segment, hashlib.sha256).hexdigest()
+
+    assert verify_signature(raw, signature) is True
+
+
+def test_whitespace_between_the_key_and_the_object_is_handled(monkeypatch):
+    monkeypatch.setattr(settings, "kora_webhook_secret", SECRET)
+
+    raw = b'{"event": "charge.success", "data" : {"reference":"r"}}'
+    signature = hmac.new(
+        SECRET.encode(), b'{"reference":"r"}', hashlib.sha256
+    ).hexdigest()
+
+    assert verify_signature(raw, signature) is True
 
 
 def test_no_secret_means_nothing_is_trusted(monkeypatch):
-    monkeypatch.setattr(settings, "paystack_webhook_secret", "")
-    raw, signature = _signed({"event": "charge.success"})
+    monkeypatch.setattr(settings, "kora_webhook_secret", "")
+    monkeypatch.setattr(settings, "kora_secret_key", "")
+    raw, signature = _signed({"reference": "r"})
 
     assert verify_signature(raw, signature) is False
+
+
+def test_the_secret_key_signs_when_no_webhook_secret_is_set(monkeypatch):
+    """Kora has no separate webhook secret — it signs with the API key."""
+    monkeypatch.setattr(settings, "kora_webhook_secret", "")
+    monkeypatch.setattr(settings, "kora_secret_key", SECRET)
+    raw, signature = _signed({"reference": "r"})
+
+    assert verify_signature(raw, signature) is True
+
+
+# --- Amounts ------------------------------------------------------------------
+
+
+def test_the_amount_is_read_as_whole_shillings():
+    """
+    The other trap. Kora charges the major unit, so 350 means KES 350 — there
+    is no division by a hundred anywhere, and adding one back would credit a
+    Synapse plan for three shillings.
+    """
+    assert to_shillings(350) == 350
+    assert to_shillings("350.00") == 350
+    assert to_shillings(1250.0) == 1250
+    assert to_shillings(None) == 0
+    assert to_shillings("not a number") == 0
 
 
 # --- Which plan was paid for --------------------------------------------------
@@ -213,13 +283,13 @@ async def test_only_sellable_plans_are_advertised(client):
 # --- Checkout -----------------------------------------------------------------
 
 
-class _FakePaystack:
+class _FakeKora:
     """
-    Stands in for Paystack and remembers what it was sent.
+    Stands in for Kora and remembers what it was sent.
 
     What matters in these tests is the *request* — the amount and the metadata
     are what a wrong checkout gets wrong, and both are decided on this side
-    rather than by Paystack.
+    rather than by Kora.
     """
 
     def __init__(self):
@@ -231,9 +301,9 @@ class _FakePaystack:
             200,
             json={
                 "status": True,
+                "message": "Charge created successfully",
                 "data": {
-                    "authorization_url": "https://checkout.paystack.com/abc123",
-                    "access_code": "abc123",
+                    "checkout_url": "https://checkout.korapay.com/abc123/pay",
                     "reference": self.payload["reference"],
                 },
             },
@@ -241,7 +311,7 @@ class _FakePaystack:
 
 
 @pytest.fixture
-def paystack(client, monkeypatch):
+def kora(client, monkeypatch):
     """
     Swaps the *outbound* client only.
 
@@ -249,8 +319,8 @@ def paystack(client, monkeypatch):
     own requests into the app, since both are httpx — so the seam is the
     dependency, not the library.
     """
-    monkeypatch.setattr(settings, "paystack_secret_key", "sk_test_x")
-    fake = _FakePaystack()
+    monkeypatch.setattr(settings, "kora_secret_key", "sk_test_x")
+    fake = _FakeKora()
 
     outbound = httpx.AsyncClient(transport=httpx.MockTransport(fake.handle))
     app.dependency_overrides[get_http_client] = lambda: outbound
@@ -258,7 +328,7 @@ def paystack(client, monkeypatch):
     return fake
 
 
-async def test_checkout_returns_a_link_and_its_reference(client, paystack):
+async def test_checkout_returns_a_link_and_its_reference(client, kora):
     headers, _ = await sign_in(client)
 
     response = await client.post(
@@ -267,12 +337,15 @@ async def test_checkout_returns_a_link_and_its_reference(client, paystack):
 
     assert response.status_code == 200
     body = response.json()
-    assert body["authorization_url"].startswith("https://")
+    assert body["checkout_url"].startswith("https://")
+    # Kept alongside `checkout_url` for one release, so a build already on a
+    # student's phone does not lose its Upgrade button.
+    assert body["authorization_url"] == body["checkout_url"]
     assert body["reference"]
     assert body["amount_ksh"] == plan_for(Tier.PRO).price_ksh
 
 
-async def test_checkout_names_the_payer_in_the_metadata(client, paystack):
+async def test_checkout_names_the_payer_in_the_metadata(client, kora):
     """
     The whole reason the link is issued here rather than shipped in the app.
     Without this, the charge that comes back belongs to nobody in particular
@@ -284,14 +357,24 @@ async def test_checkout_names_the_payer_in_the_metadata(client, paystack):
         "/api/v1/billing/checkout", json={"tier": "friends"}, headers=headers
     )
 
-    assert paystack.payload["metadata"]["user_id"] == str(user_id)
-    assert paystack.payload["metadata"]["tier"] == "friends"
+    assert kora.payload["metadata"]["user_id"] == str(user_id)
+    assert kora.payload["metadata"]["tier"] == "friends"
+    # Kora caps metadata at five fields with names of at most twenty
+    # characters, and rejects the nested array Paystack accepted.
+    assert len(kora.payload["metadata"]) <= 5
+    assert all(len(key) <= 20 for key in kora.payload["metadata"])
+    assert all(isinstance(value, str) for value in kora.payload["metadata"].values())
 
 
-async def test_checkout_prices_the_plan_from_the_server(client, paystack):
+async def test_checkout_prices_the_plan_from_the_server(client, kora):
     """
-    In the minor unit, and from the plan table. A price the client could send
-    is a price the client could choose.
+    In whole shillings, and from the plan table.
+
+    Two claims in one test, both of which cost real money when wrong. The price
+    comes from the server, because a price the client could send is a price the
+    client could choose. And it goes out in the *major* unit — the previous
+    provider took cents, and leaving that multiplier in place would bill
+    KES 15,000 for a KES 150 plan.
     """
     headers, _ = await sign_in(client)
 
@@ -299,11 +382,12 @@ async def test_checkout_prices_the_plan_from_the_server(client, paystack):
         "/api/v1/billing/checkout", json={"tier": "standard"}, headers=headers
     )
 
-    assert paystack.payload["amount"] == plan_for(Tier.STANDARD).price_ksh * 100
-    assert paystack.payload["currency"] == "KES"
+    assert kora.payload["amount"] == plan_for(Tier.STANDARD).price_ksh
+    assert kora.payload["amount"] == 150
+    assert kora.payload["currency"] == "KES"
 
 
-async def test_a_tier_that_is_not_for_sale_cannot_be_bought(client, paystack):
+async def test_a_tier_that_is_not_for_sale_cannot_be_bought(client, kora):
     headers, _ = await sign_in(client)
 
     for tier in ("trial", "expired", "nonsense"):
@@ -312,17 +396,17 @@ async def test_a_tier_that_is_not_for_sale_cannot_be_bought(client, paystack):
         )
         assert response.status_code == 400
 
-    assert paystack.payload is None
+    assert kora.payload is None
 
 
-async def test_checkout_needs_a_signed_in_student(client, paystack):
+async def test_checkout_needs_a_signed_in_student(client, kora):
     response = await client.post("/api/v1/billing/checkout", json={"tier": "pro"})
     assert response.status_code == 401
 
 
-async def test_a_student_with_no_email_can_still_pay(client, paystack):
+async def test_a_student_with_no_email_can_still_pay(client, kora):
     """
-    Phone sign-in collects no email and Paystack demands one. Refusing to sell
+    Phone sign-in collects no email and Kora demands one. Refusing to sell
     a plan over that would lock out most of the intended users.
     """
     headers, _ = await sign_in(client)
@@ -331,7 +415,9 @@ async def test_a_student_with_no_email_can_still_pay(client, paystack):
         "/api/v1/billing/checkout", json={"tier": "pro"}, headers=headers
     )
 
-    assert "@" in paystack.payload["email"]
+    # Kora nests the payer under `customer`, where Paystack took a bare
+    # `email` at the top level.
+    assert "@" in kora.payload["customer"]["email"]
 
 
 # --- Friends ------------------------------------------------------------------

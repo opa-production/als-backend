@@ -83,7 +83,7 @@ async def get_entitlement(session: AsyncSession, user_id: uuid.UUID) -> Entitlem
     nothing a student wrote is held hostage.
 
     An unverified paid subscription is treated as expired too. The app writes
-    one optimistically when a student says they paid; until Paystack confirms
+    one optimistically when a student says they paid; until Kora confirms
     it, that is a claim, and a claim is not an entitlement.
     """
     subscription = await session.scalar(

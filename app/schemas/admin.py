@@ -369,7 +369,7 @@ class SubscriptionStatsOut(BaseModel):
     total_paying: int
     total_trial: int
     total_expired: int
-    #: Paid subscriptions the app wrote on a student's word that Paystack has
+    #: Paid subscriptions the app wrote on a student's word that Kora has
     #: never confirmed. Each is either a payment that went missing or a plan
     #: nobody paid for.
     total_unverified: int
@@ -445,7 +445,7 @@ class OpsHealthOut(BaseModel):
     database_ok: bool
     database_latency_ms: float
     #: Which integrations actually have credentials. A console that shows
-    #: revenue while Paystack is unconfigured is showing history, not a
+    #: revenue while Kora is unconfigured is showing history, not a
     #: business, and this row is what says so.
     integrations: dict[str, bool]
     counts: dict[str, int]

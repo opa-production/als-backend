@@ -13,7 +13,7 @@ from app.models.billing import Payment
 from app.schemas.admin import ActionResult, AdminPaymentRow, Page
 from app.services import audit as audit_service
 from app.services import billing as billing_service
-from app.services.paystack import verify_transaction
+from app.services.kora import verify_transaction
 from app.services.plans import Tier
 
 router = APIRouter()
@@ -35,7 +35,7 @@ async def list_payments(
     tier: str | None = None,
     channel: str | None = Query(default=None, description="card | mobile_money | bank"),
     q: str | None = Query(
-        default=None, description="Matches the Paystack reference, or the payer."
+        default=None, description="Matches the Kora reference, or the payer."
     ),
     since: datetime | None = None,
     until: datetime | None = None,
@@ -128,7 +128,7 @@ async def get_payment(payment_id: uuid.UUID, session: DbSession) -> dict:
 @router.post(
     "/{reference}/reconcile",
     response_model=ActionResult,
-    summary="Re-check a payment against Paystack",
+    summary="Re-check a payment against Kora",
 )
 async def reconcile(
     reference: str,
@@ -138,21 +138,21 @@ async def reconcile(
     ip: ClientIp,
 ) -> ActionResult:
     """
-    Asks Paystack what actually happened, and applies the answer.
+    Asks Kora what actually happened, and applies the answer.
 
     This exists because webhooks are delivered over the internet. A student
-    pays, Paystack fires the webhook, the request is dropped or the container
+    pays, Kora fires the webhook, the request is dropped or the container
     is mid-deploy, and the money is real while the subscription is not. Nothing
     in the system notices — the student is charged and locked out, and the
     first signal is a complaint.
 
-    Paystack's own record is the authority, so this endpoint re-reads it and
+    Kora's own record is the authority, so this endpoint re-reads it and
     re-runs the same activation path the webhook would have. It is safe to call
     repeatedly: ``record_payment`` keys on the reference, so a charge already
     credited is recognised rather than credited twice.
     """
     if not settings.payments_configured:
-        raise AppError("Paystack is not configured in this environment.")
+        raise AppError("Kora is not configured in this environment.")
 
     payment = await session.scalar(
         select(Payment).where(Payment.reference == reference)
@@ -168,13 +168,13 @@ async def reconcile(
         raise NotFound("The account behind that payment is gone.")
 
     # The stored row already names an owner, so the ownership question here is
-    # not "whose payment is this" but "does Paystack still agree". A charge
+    # not "whose payment is this" but "does Kora still agree". A charge
     # whose metadata names a different account means the reference was reused
     # or the row is wrong, and either way this is not a button to press.
     claimed = (charge.metadata or {}).get("user_id")
     if claimed and str(claimed) != str(user.id):
         raise AppError(
-            f"Paystack attributes {reference} to a different account "
+            f"Kora attributes {reference} to a different account "
             f"({claimed}). Investigate before crediting anyone.",
             status_code=409,
         )
@@ -183,13 +183,13 @@ async def reconcile(
 
     # ``record_payment`` keys on the reference and returns the row that already
     # exists — which is this one, in the normal case. It is called anyway so
-    # that a charge Paystack knows about and this database somehow does not
+    # that a charge Kora knows about and this database somehow does not
     # still gets a row.
     _, created = await billing_service.record_payment(
         session, user_id=user.id, charge=charge, tier=tier
     )
 
-    # Refreshed from Paystack either way: a charge that was pending here and
+    # Refreshed from Kora either way: a charge that was pending here and
     # has since succeeded there is the entire reason anyone calls this.
     payment.status = charge.status
     payment.channel = charge.channel or payment.channel
@@ -239,5 +239,5 @@ async def reconcile(
         )
     return ActionResult(
         ok=False,
-        message=f"Paystack reports this payment as {charge.status}. Nothing granted.",
+        message=f"Kora reports this payment as {charge.status}. Nothing granted.",
     )

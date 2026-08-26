@@ -124,29 +124,58 @@ class Settings(BaseSettings):
     otp_max_sends_per_hour: int = 5
 
     # --- Payments ---------------------------------------------------------
-    paystack_secret_key: str = ""
-    paystack_webhook_secret: str = ""
+    #
+    # Kora (korahq.com). Two things differ from the Paystack integration this
+    # replaced, and both are silent when wrong: Kora charges in the **major**
+    # unit (350 means KES 350, not 3.50), and it signs webhooks over only the
+    # `data` object with SHA-256. See app/services/kora.py.
+    kora_secret_key: str = ""
+    #: Only used by a browser checkout widget, which this product does not have.
+    #: Kept so the pair can be set together and nobody wonders where it went.
+    kora_public_key: str = ""
 
-    #: Where Paystack sends the browser once a payment succeeds.
+    #: Kora signs webhooks with the secret key itself — there is no separate
+    #: webhook secret to copy from the dashboard. This exists only to pin a
+    #: different value if that ever changes; blank means "use the secret key".
+    kora_webhook_secret: str = ""
+
+    #: Where Kora sends the browser once a payment finishes.
     #:
-    #: Blank means "use whatever the Paystack dashboard is set to", which is
-    #: the safe default: the app does not depend on this redirect, it verifies
-    #: the reference it was given when the browser closes. Set it to the app's
-    #: deep link (``als://billing``) to have the payment page bounce straight
-    #: back into the app instead.
-    paystack_callback_url: str = ""
+    #: Blank means "use whatever the Kora dashboard is set to", which is the
+    #: safe default: the app does not depend on this redirect, it verifies the
+    #: reference it was given when the browser closes. Set it to the app's deep
+    #: link (`als://billing`) to have the payment page bounce straight back into
+    #: the app instead.
+    kora_callback_url: str = ""
 
     #: Domain for the stand-in address used when an account has no email.
     #:
-    #: Paystack requires an email on every transaction and phone sign-in does
-    #: not collect one. The address is per-account and never receives mail —
-    #: it exists so a charge can be opened at all, and `metadata.user_id` is
-    #: what actually ties the payment to a student.
-    receipt_email_domain: str = "als.ardena.co.ke"
+    #: Kora requires a customer email on every charge and phone sign-in does not
+    #: collect one. The address is per-account and never receives mail — it
+    #: exists so a charge can be opened at all, and `metadata.user_id` is what
+    #: actually ties the payment to a student.
+    receipt_email_domain: str = "als.ardena.xyz"
 
     @property
     def payments_configured(self) -> bool:
-        return bool(self.paystack_secret_key)
+        return bool(self.kora_secret_key)
+
+    # --- This service's own address ---------------------------------------
+    #: The public origin, no trailing slash.
+    #:
+    #: Needed because a webhook URL cannot be derived from an inbound request:
+    #: behind nginx the app sees `127.0.0.1:8000`, and handing Kora that would
+    #: point every payment notification at the loopback interface. Setting it
+    #: per environment is also what stops a staging deploy from registering
+    #: itself for production's webhooks.
+    public_base_url: str = ""
+
+    @property
+    def webhook_url(self) -> str:
+        """Where Kora should post a completed charge. Blank if unknown."""
+        if not self.public_base_url:
+            return ""
+        return f"{self.public_base_url.rstrip('/')}/api/v1/billing/webhook"
 
     # --- Outbound ---------------------------------------------------------
     #: Every outbound call gets a deadline. A hung upstream must fail in
@@ -181,6 +210,12 @@ class Settings(BaseSettings):
             problems.append("JWT_SECRET is still the default")
         if not self.storage_configured:
             problems.append("Supabase storage is not configured")
+        if not self.payments_configured:
+            problems.append("KORA_SECRET_KEY is not set — nothing can be sold")
+        if not self.public_base_url:
+            problems.append(
+                "PUBLIC_BASE_URL is not set — Kora would have nowhere to send webhooks"
+            )
         if self.debug:
             problems.append("DEBUG is on")
 

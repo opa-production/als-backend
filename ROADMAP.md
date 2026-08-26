@@ -28,7 +28,7 @@ changed, one response out. Testable entirely through Swagger.
 
 ## Intermediate — needs another system to be real
 
-Each of these depends on something outside the process: a bucket, Paystack, a
+Each of these depends on something outside the process: a bucket, Kora, a
 push service. The logic is not hard; the integration is where the surprises
 live.
 
@@ -40,9 +40,9 @@ live.
 | `GET /materials/{id}/download-url` | Short-lived signed URL. |
 | Units / events / classes CRUD | Mostly covered by `/sync`; discrete routes only where the app needs one row. |
 | `GET /billing/subscription` | — |
-| `POST /billing/checkout` | Paystack secret key. Issues the payment link, so the charge carries a user id. |
-| `POST /billing/verify` | Paystack secret key. |
-| `POST /billing/webhook` | Paystack webhook secret. **This is what makes a subscription real** — the app currently writes `verified: false` on a student's word. |
+| `POST /billing/checkout` | Kora secret key. Issues the payment link, so the charge carries a user id. |
+| `POST /billing/verify` | Kora secret key. |
+| `POST /billing/webhook` | Kora webhook secret. **This is what makes a subscription real** — the app currently writes `verified: false` on a student's word. |
 | Friends group: create / invite / join / members | Seat accounting. |
 | Usage counters and enforcement | Mirrors `src/theme/plans.js`, with the server as the authority. |
 | Notification scheduling | Expo push tokens. |
@@ -95,7 +95,7 @@ type.
 `python scripts/create_admin.py --email you@ardena.co.ke --role owner`.
 
 The one piece here that is not a read: `POST /admin/payments/{reference}/reconcile`
-re-reads Paystack and applies the answer, which is how a payment whose webhook
+re-reads Kora and applies the answer, which is how a payment whose webhook
 never arrived gets credited without anyone editing a row by hand.
 
 ---

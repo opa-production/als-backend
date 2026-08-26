@@ -23,11 +23,13 @@ async def summary(session: DbSession) -> RevenueSummaryOut:
     """
     Every headline revenue figure, in KES.
 
-    Amounts are whole shillings, as stored. Paystack works in the smallest
-    unit and the conversion already happened at the boundary in
-    ``app/services/paystack.py``; doing it again here is how a dashboard ends
-    up a hundred times wrong in a way nobody notices while the numbers are
-    small.
+    Amounts are whole shillings, as stored, with no conversion anywhere.
+
+    Worth stating because the previous provider worked in the minor unit and
+    every amount had to be divided by a hundred at the boundary. Kora charges
+    the major unit, so that division is gone — and reintroducing it out of
+    habit is how a dashboard ends up a hundred times wrong in a way nobody
+    notices while the numbers are still small.
 
     ``growth_30d_pct`` is null rather than zero when there is no prior period.
     A first month has no growth rate, and inventing one puts a fake number on

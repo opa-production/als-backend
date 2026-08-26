@@ -63,7 +63,7 @@ services:
       #   SMS_*        blank -> OTP codes are written to the Render log
       #   SUPABASE_*   blank -> only /materials/* is unavailable
       #   GOOGLE_*     blank -> /auth/google returns "not configured"
-      #   PAYSTACK_*   blank -> /billing/checkout and /billing/verify both
+      #   KORA_*       blank -> /billing/checkout and /billing/verify both
       #                         report that payments are not configured
       # Fill them in from the Render dashboard when you want to test that path.
       - key: SMS_API_KEY
@@ -78,13 +78,20 @@ services:
         sync: false
       - key: GOOGLE_CLIENT_IDS
         sync: false
-      - key: PAYSTACK_SECRET_KEY
+      - key: KORA_SECRET_KEY
         sync: false
-      - key: PAYSTACK_WEBHOOK_SECRET
+      - key: KORA_PUBLIC_KEY
         sync: false
-      # Blank uses the Paystack dashboard's callback. Set to als://billing
-      # to return the student straight to the app after paying.
-      - key: PAYSTACK_CALLBACK_URL
+      # Blank: Kora signs webhooks with the secret key itself.
+      - key: KORA_WEBHOOK_SECRET
+        sync: false
+      # Blank uses the Kora dashboard's redirect. Set to als://billing to
+      # return the student straight to the app after paying.
+      - key: KORA_CALLBACK_URL
+        sync: false
+      # Kora is told where to post webhooks when each charge is opened, so
+      # this has to be the deploy's own public origin.
+      - key: PUBLIC_BASE_URL
         sync: false
 
 databases:

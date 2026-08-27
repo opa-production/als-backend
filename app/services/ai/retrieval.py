@@ -19,12 +19,17 @@ import re
 import uuid
 from dataclasses import dataclass
 
+import structlog
 from sqlalchemy import Float, cast, func, literal, select
+from sqlalchemy.dialects.postgresql import REGCONFIG
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.course import Unit
 from app.models.knowledge import Material, MaterialChunk
+
+log = structlog.get_logger()
 
 
 @dataclass(frozen=True)
@@ -88,12 +93,24 @@ async def search(
     top_k = limit or settings.ai_retrieval_top_k
     dialect = session.bind.dialect.name if session.bind is not None else "postgresql"
 
-    if dialect == "postgresql":
-        rows = await _search_postgres(session, user_id, terms, unit_code, top_k)
-    else:
-        rows = await _search_portable(session, user_id, terms, unit_code, top_k)
+    if dialect != "postgresql":
+        return await _search_portable(session, user_id, terms, unit_code, top_k)
 
-    return rows
+    # Retrieval failing must not fail the answer.
+    #
+    # A search that raises leaves the transaction aborted on Postgres, and
+    # every later statement in the request dies with InFailedSQLTransactionError
+    # naming an innocent query -- which is how a broken full-text query
+    # presented as the quota counter being broken. The savepoint contains it,
+    # and an empty result is a meaningful answer here: the tutor says it found
+    # nothing in the material and answers generally, which is exactly the
+    # behaviour a student with no uploads already gets.
+    try:
+        async with session.begin_nested():
+            return await _search_postgres(session, user_id, terms, unit_code, top_k)
+    except SQLAlchemyError:
+        log.exception("retrieval_failed", user_id=str(user_id))
+        return []
 
 
 def _base_query(user_id: uuid.UUID, unit_code: str | None):
@@ -142,8 +159,20 @@ async def _search_postgres(
     explicitly so ranking, not matching, does the discriminating.
     """
     query_text = " | ".join(terms)
-    vector = func.to_tsvector(literal("english"), MaterialChunk.content)
-    tsquery = func.to_tsquery(literal("english"), literal(query_text))
+
+    # The configuration must be typed as regconfig. Sent as a plain bind
+    # parameter it arrives with no type, and Postgres cannot choose between
+    # to_tsvector(regconfig, text) and to_tsvector(text) -- it rejects the
+    # statement rather than guessing. psycopg2 inlines literals so it never
+    # hit this; asyncpg uses real prepared statements, so it always does.
+    #
+    # This path runs only on Postgres, and the tests run on SQLite, so nothing
+    # in CI exercises it. Whatever it raised aborted the request's transaction,
+    # and the traceback that surfaced named the next query to touch the
+    # session -- record_usage -- rather than this one.
+    config = literal("english", type_=REGCONFIG)
+    vector = func.to_tsvector(config, MaterialChunk.content)
+    tsquery = func.to_tsquery(config, literal(query_text))
     rank = cast(func.ts_rank(vector, tsquery), Float)
 
     statement = (

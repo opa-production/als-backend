@@ -74,6 +74,27 @@ def install_exception_handlers(app: FastAPI) -> None:
         # almost always the one the caller got wrong.
         first = exc.errors()[0] if exc.errors() else {}
         field = ".".join(str(part) for part in first.get("loc", ())[1:]) or "request"
+
+        # Logged, because a 422 used to leave no trace on the server at all:
+        # the caller saw "field: message" and the journal showed only a 422
+        # request line, so "the app says something about the date" was
+        # unanswerable without reproducing it by hand.
+        #
+        # Field names and Pydantic's message, never the submitted value — the
+        # bodies that fail validation here are sign-up forms and profile edits,
+        # and a rejected phone number is still a phone number.
+        log.info(
+            "validation_error",
+            path=request.url.path,
+            field=field,
+            error=first.get("msg", ""),
+            error_type=first.get("type", ""),
+            fields=[
+                ".".join(str(part) for part in error.get("loc", ())[1:])
+                for error in exc.errors()[:5]
+            ],
+        )
+
         return _envelope(
             f"{field}: {first.get('msg', 'is not valid')}",
             # Starlette renamed this; the number is the same either way.

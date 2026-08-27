@@ -272,3 +272,41 @@ async def test_chats_carry_their_messages_and_do_not_duplicate(client):
 async def test_sync_needs_a_token(client):
     assert (await client.post("/api/v1/sync", json={})).status_code == 401
     assert (await client.get("/api/v1/sync")).status_code == 401
+
+
+async def test_an_empty_since_means_a_first_run(client):
+    """
+    `?since=` is what a client builds from a null cursor, and it must mean
+    "give me everything" rather than 422.
+
+    This is the first sync a device ever attempts -- the one run where there is
+    genuinely nothing to sync from -- and rejecting it produced
+    `since: Input should be a valid datetime or date, input too short`, which
+    points at the date parser rather than at the missing cursor.
+    """
+    headers, _ = await sign_in(client)
+
+    await client.post("/api/v1/sync", json={"units": [_unit()]}, headers=headers)
+
+    blank = await client.get("/api/v1/sync?since=", headers=headers)
+    assert blank.status_code == 200, blank.text
+
+    omitted = await client.get("/api/v1/sync", headers=headers)
+    assert omitted.status_code == 200
+
+    # Not merely accepted -- it has to behave as no cursor at all.
+    assert blank.json()["units"] == omitted.json()["units"]
+    assert len(blank.json()["units"]) == 1
+
+
+async def test_whitespace_only_since_is_also_a_first_run(client):
+    headers, _ = await sign_in(client)
+    assert (await client.get("/api/v1/sync?since=%20", headers=headers)).status_code == 200
+
+
+async def test_a_genuinely_malformed_since_is_still_rejected(client):
+    """Being liberal about empty must not become being liberal about wrong."""
+    headers, _ = await sign_in(client)
+    bad = await client.get("/api/v1/sync?since=not-a-date", headers=headers)
+    assert bad.status_code == 422
+    assert "since" in bad.json()["message"]

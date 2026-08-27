@@ -1,5 +1,7 @@
-# systemd unit for the ALS extraction worker. Installed to /etc/systemd/system/
-# by scripts/provision.sh.
+# systemd unit for the ALS extraction worker.
+#
+# Installed by hand — see DEPLOYMENT.md section 2. Edit it here, copy it to
+# /etc/systemd/system/, then `systemctl daemon-reload`.
 #
 # A separate process from the API, deliberately: PDF parsing is CPU-bound, and
 # a handler that blocks the event loop stalls every other request on that

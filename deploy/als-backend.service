@@ -1,5 +1,7 @@
-# systemd unit for the ALS API. Installed to /etc/systemd/system/ by
-# scripts/provision.sh.
+# systemd unit for the ALS API.
+#
+# Installed by hand — see DEPLOYMENT.md section 2. Edit it here, copy it to
+# /etc/systemd/system/, then `systemctl daemon-reload`.
 
 [Unit]
 Description=ALS API

@@ -49,40 +49,128 @@ production without them.
 
 ### 2. The VPS
 
-SSH in as root and run:
+The server is set up and maintained by hand. There is no provisioning script in
+this repo, deliberately: a script that writes sudoers files, nginx sites and SSH
+keys fights whatever is already on a box somebody else built, and the two ways
+of doing it drift.
+
+What follows is not instructions to run blindly — it is the list of things
+`scripts/deploy.sh` and the systemd units *assume are already true*. Every line
+here has broken a deploy at least once.
+
+**Packages.**
 
 ```bash
-git clone https://github.com/Deon62/als-backend.git /tmp/als
-sudo bash /tmp/als/scripts/provision.sh \
-    --domain api.ardena.co.ke \
-    --repo git@github.com:Deon62/als-backend.git
+sudo apt-get install -y python3.12 python3.12-venv python3.12-dev \
+    build-essential nginx certbot python3-certbot-nginx
 ```
 
-This installs Python 3.12, nginx, certbot and ufw; creates the `als` user;
-clones the repo to `/opt/als-backend`; builds the virtualenv; installs the
-systemd unit and the nginx site; opens the firewall; and generates an SSH key
-for CI. It is safe to re-run — re-run it after editing anything in `deploy/`.
+`python3.12-venv` is a separate package from the interpreter on Debian and
+Ubuntu. Without it `python3.12` exists, `python3.12 -m venv` fails on
+`ensurepip`, and the failure only appears at deploy time. `deploy.sh` works
+around it by building the environment without pip and fetching pip separately,
+and says loudly that it did — but that is a workaround, not a fix.
 
-It then prints the three remaining steps, which need your input:
+**A service account.** The units run as `als` and the deploy connects as `als`.
 
-**Fill in the secrets.** `sudo nano /etc/als-backend/env` — every `CHANGEME`
-must be replaced. Then `sudo systemctl start als-backend`.
+```bash
+sudo useradd --create-home --shell /bin/bash als
+```
 
-**Point DNS at the server** (an `A` record for your domain), wait for it to
-resolve, then `sudo certbot --nginx -d api.ardena.co.ke`. certbot rewrites the
-nginx site in place to add TLS and the HTTP→HTTPS redirect, and installs a
-renewal timer.
+**The checkout**, at `/opt/als-backend`, owned by `als`, on an **HTTPS** remote:
 
-**Add the GitHub secrets** it prints: `SSH_HOST`, `SSH_USER`, `SSH_KEY`. If the
-repo is private, also add the printed public key as a read-only *deploy key* so
-the server can `git fetch`.
+```bash
+sudo -u als git clone https://github.com/opa-production/als-backend.git /opt/als-backend
+```
 
-Optional but worth doing: set `SSH_HOST_KEY` too (`ssh-keyscan -t ed25519 <ip>`).
-Without it, every CI run trusts whatever host answers on that address.
+Not the `git@github.com:` form. That needs a key registered with GitHub, and the
+deploy key travels the other way — GitHub Actions into this server. `deploy.sh`
+repairs an SSH remote automatically for a public repo; for a private one, add a
+read-only deploy key and keep the SSH URL.
+
+**The virtualenv**, at `/opt/als-backend/.venv`:
+
+```bash
+sudo -u als python3.12 -m venv /opt/als-backend/.venv
+sudo -u als /opt/als-backend/.venv/bin/pip install /opt/als-backend
+```
+
+`deploy.sh` builds one if it is missing, so this is a convenience rather than a
+requirement.
+
+**The secrets file**, at `/etc/als-backend/env`, root-owned and `0600` — outside
+the git tree, so a bad checkout can never expose it. Copy `.env.example` and
+fill it in; that file documents every variable and what breaks without it.
+
+```bash
+sudo install -d -m 755 /etc/als-backend
+sudo install -m 600 /dev/null /etc/als-backend/env
+sudo nano /etc/als-backend/env
+```
+
+**The systemd units.** Both live in `deploy/` in this repo and are installed
+from the checkout, so editing them there and copying is the whole update path:
+
+```bash
+sudo install -m 644 /opt/als-backend/deploy/als-backend.service /etc/systemd/system/
+sudo install -m 644 /opt/als-backend/deploy/als-worker.service  /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now als-backend als-worker
+```
+
+`als-worker` is the extraction worker. Without it, uploaded PDFs sit at
+`pending` forever, nothing is ever indexed, and the tutor answers every
+coursework question with "I could not find this in your material" — which looks
+like the tutor being broken rather than a worker being down.
+
+**The sudoers rule.** This is the one CI genuinely cannot do for itself, and its
+absence is what makes a deploy stop after installing the code and running the
+migrations:
+
+```bash
+printf 'als ALL=(root) NOPASSWD: /bin/systemctl restart als-backend\n' \
+    | sudo tee /etc/sudoers.d/als-backend
+printf 'als ALL=(root) NOPASSWD: /bin/systemctl restart als-worker\n' \
+    | sudo tee -a /etc/sudoers.d/als-backend
+sudo chmod 440 /etc/sudoers.d/als-backend
+sudo visudo -cf /etc/sudoers.d/als-backend
+```
+
+Two exact commands, not `NOPASSWD: ALL`. The CI deploy key can reach this
+account, so a blanket rule would make that key equivalent to root.
+
+**nginx.** `deploy/nginx.conf` is the site, with `__DOMAIN__` to substitute:
+
+```bash
+sed "s/__DOMAIN__/als.ardena.xyz/g" /opt/als-backend/deploy/nginx.conf \
+    | sudo tee /etc/nginx/sites-available/als-backend > /dev/null
+sudo ln -sf /etc/nginx/sites-available/als-backend /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Then, once DNS resolves: `sudo certbot --nginx -d als.ardena.xyz`. certbot
+rewrites the site in place to add TLS and the HTTP→HTTPS redirect. After that,
+edit `deploy/nginx.conf` here and re-run the `sed` above rather than hand-editing
+the installed file — then certbot again.
+
+**The CI key.** A keypair whose public half is in `/home/als/.ssh/authorized_keys`
+and whose private half is the `VPS_SSH_KEY` repository secret. If SSH is already
+set up for this box, that key is whatever is already working — nothing here
+needs a new one.
+
+**GitHub's host key**, so the deploy's own `git fetch` is neither prompted nor
+spoofable:
+
+```bash
+sudo -u als ssh-keyscan -t ed25519 github.com >> /home/als/.ssh/known_hosts
+```
+
+**Firewall**, if ufw is in use: allow OpenSSH and 'Nginx Full'.
 
 ---
 
 ### 3. Kora
+
 
 Payments run on [Kora](https://korahq.com). Two settings, both from the
 dashboard, and one thing to get right on their side.

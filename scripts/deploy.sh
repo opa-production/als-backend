@@ -60,7 +60,7 @@ echo "==> current $PREVIOUS_SHA -> target $TARGET_SHA"
 # this box changing. Two ways it has actually happened:
 #
 #   · The clone used an SSH URL (git@github.com:...), which needs a key
-#     registered with GitHub. The key provision.sh generates is for the opposite
+#     registered with GitHub. The deploy key travels the opposite
 #     direction — GitHub Actions into this server — so `git fetch` fails with
 #     "Permission denied (publickey)" that names github.com, not this host.
 #
@@ -149,10 +149,10 @@ fi
 
 # --- The virtualenv -----------------------------------------------------------
 #
-# Built here if it is missing, rather than assumed. provision.sh creates it, but
-# a box can end up without one for ordinary reasons: provisioning that stopped
-# half way, a venv built against a Python that has since been removed, or a
-# restore that skipped it because .venv is gitignored.
+# Built here if it is missing, rather than assumed. A box can end up without one
+# for ordinary reasons: a server set up by hand that skipped the step, a venv
+# built against a Python that has since been removed, or a restore that left it
+# out because .venv is gitignored.
 #
 # Recreating is safe and idempotent — nothing in it is state. Everything it
 # holds comes from pyproject.toml, and the next two lines rebuild it anyway.
@@ -172,7 +172,7 @@ if [ ! -x .venv/bin/pip ]; then
     # a python says nothing about whether it can build a venv, and the only way
     # to find out is to try.
     #
-    # 3.12 first because provision.sh installs it and pyproject requires >= 3.12;
+    # 3.12 first because pyproject requires >= 3.12;
     # then whatever `python3` points at; then 3.13 for a newer box.
     created=""
     tried=""
@@ -263,7 +263,7 @@ if [ ! -x .venv/bin/pip ]; then
         # Said plainly because it looks like a gap in the automation and is not.
         echo "!! This deploy cannot install it itself, by design: the deploy" >&2
         echo "!! account's sudo is limited to restarting one service, so that a" >&2
-        echo "!! leaked CI key is not equivalent to root. See provision.sh." >&2
+        echo "!! leaked CI key is not equivalent to root. See DEPLOYMENT.md." >&2
         exit 1
     fi
 fi
@@ -280,11 +280,11 @@ echo "==> alembic upgrade head"
 
 # --- Restarting without root --------------------------------------------------
 #
-# The clean path is `sudo systemctl restart`, which provision.sh grants this
-# account for exactly one unit. On a box where that sudoers rule was never
-# written, the deploy would otherwise stop here having already installed the new
-# code and run the migrations — everything done except the one step that makes
-# any of it take effect.
+# The clean path is `sudo systemctl restart`, which the server grants this account
+# for exactly two units. On a box where that sudoers rule was never written, the
+# deploy would otherwise stop here having already installed the new code and run
+# the migrations — everything done except the one step that makes any of it take
+# effect.
 #
 # So there is a second route, and it is safe only under conditions this checks
 # rather than assumes:
@@ -354,18 +354,17 @@ if ! restart_service; then
     echo "!! The new code is installed and the migrations have run, but the" >&2
     echo "!! service is still serving the old build." >&2
     echo "" >&2
-    echo "!! Finish provisioning this box once, as root. It is idempotent --" >&2
-    echo "!! it will not re-clone, overwrite /etc/als-backend/env, or replace" >&2
-    echo "!! the CI key:" >&2
+    echo "!! Grant this account permission to restart the service, once, as root." >&2
+    echo "!! Two exact commands, not NOPASSWD: ALL -- the CI deploy key can reach" >&2
+    echo "!! this account, so a blanket rule would make that key equivalent to root:" >&2
     echo "" >&2
-    echo "!!     sudo bash $APP_DIR/scripts/provision.sh \\" >&2
-    echo "!!       --repo ${EXPECTED_REPO:-<repo url>} \\" >&2
-    echo "!!       --domain <your domain>" >&2
+    echo "!!     printf '$(id -un) ALL=(root) NOPASSWD: /bin/systemctl restart $SERVICE\\n' \\" >&2
+    echo "!!       | sudo tee /etc/sudoers.d/$SERVICE" >&2
+    echo "!!     printf '$(id -un) ALL=(root) NOPASSWD: /bin/systemctl restart $WORKER\\n' \\" >&2
+    echo "!!       | sudo tee -a /etc/sudoers.d/$SERVICE" >&2
+    echo "!!     sudo chmod 440 /etc/sudoers.d/$SERVICE" >&2
     echo "" >&2
-    echo "!! Or just the two pieces this box is missing:" >&2
-    echo "!!     sudo apt-get install -y python3.12-venv" >&2
-    echo "!!     echo '$(id -un) ALL=(root) NOPASSWD: /bin/systemctl restart $SERVICE' \\" >&2
-    echo "!!       | sudo tee /etc/sudoers.d/$SERVICE && sudo chmod 440 /etc/sudoers.d/$SERVICE" >&2
+    echo "!! The full list of what this box needs is in DEPLOYMENT.md section 2." >&2
     exit 1
 fi
 

@@ -5,8 +5,39 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 import httpx
+import structlog
 
 from app.core.config import settings
+
+log = structlog.get_logger()
+
+
+def _explain(response: httpx.Response, action: str, **context: object) -> None:
+    """
+    Record what the storage API actually said.
+
+    Only the status code was logged before, which is close to useless here:
+    Supabase answers 400 for a missing bucket, a bad path, an expired key and a
+    duplicate object alike, and the difference is entirely in the body. Chasing
+    "Could not start the upload (400)" meant reproducing it by hand against the
+    API, which is the sort of thing this log exists to make unnecessary.
+
+    The body is truncated and goes to the journal only. It can name the bucket
+    and the object path, which are not for the caller.
+    """
+    detail = ""
+    try:
+        detail = response.text[:300]
+    except Exception:  # a streamed or already-closed response
+        detail = "<unreadable>"
+
+    log.warning(
+        "storage_request_failed",
+        action=action,
+        status=response.status_code,
+        detail=detail,
+        **context,
+    )
 
 
 class Bucket(StrEnum):
@@ -126,6 +157,7 @@ class SupabaseStorage:
             headers=self._headers,
         )
         if response.status_code >= 400:
+            _explain(response, "signed_upload_url", bucket=str(bucket), path=path)
             raise StorageError(f"Could not start the upload ({response.status_code}).")
 
         payload = response.json()
@@ -152,6 +184,7 @@ class SupabaseStorage:
             json={"expiresIn": ttl},
         )
         if response.status_code >= 400:
+            _explain(response, "signed_download_url")
             raise StorageError(f"Could not sign that file ({response.status_code}).")
 
         return f"{self._base}/storage/v1{response.json()['signedURL']}"
@@ -174,4 +207,5 @@ class SupabaseStorage:
             json={"prefixes": paths},
         )
         if response.status_code >= 400:
+            _explain(response, "delete")
             raise StorageError(f"Could not delete those files ({response.status_code}).")

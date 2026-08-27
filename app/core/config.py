@@ -15,8 +15,20 @@ class Settings(BaseSettings):
     boot, which is when someone is still watching.
     """
 
+    #: Two sources, in increasing priority: a local .env for development, and
+    #: the operator-managed file on a server. Real environment variables still
+    #: beat both, so systemd's EnvironmentFile stays authoritative for the
+    #: service itself.
+    #:
+    #: The second path is what makes the ops scripts work. systemd hands the
+    #: settings to the API and the worker, but `scripts/create_admin.py` run
+    #: over SSH inherits nothing — so it fell back to the built-in default
+    #: connection string and tried to reach a database on localhost, on a box
+    #: whose Postgres is in another country. Reading the file directly means a
+    #: script behaves the same way the service does, without ceremony at the
+    #: call site. Missing files are ignored, so this is inert on a laptop.
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(".env", "/etc/als-backend/env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )

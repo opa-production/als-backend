@@ -256,3 +256,26 @@ async def test_usage_reports_the_trial_meters(client):
 
 async def test_usage_needs_a_token(client):
     assert (await client.get("/api/v1/me/usage")).status_code == 401
+
+
+def test_settings_also_read_the_server_settings_file() -> None:
+    """
+    Ops scripts inherit nothing over SSH.
+
+    systemd hands /etc/als-backend/env to the API and the worker, but
+    `scripts/create_admin.py` run by hand gets no environment at all — so it
+    fell back to the built-in default connection string and tried to reach a
+    database on localhost, on a box whose Postgres is in another country. The
+    fix is for Settings to read that file itself; this pins it, because the
+    symptom is remote and the cause is one line.
+    """
+    from app.core.config import Settings
+
+    sources = Settings.model_config["env_file"]
+    assert "/etc/als-backend/env" in sources, (
+        "Settings no longer reads the server settings file, so every ops script "
+        "run over SSH will silently fall back to the localhost default."
+    )
+    # .env must stay first: on a laptop it is the only file that exists, and a
+    # developer's settings must never be overridden by a stray system file.
+    assert sources[0] == ".env"

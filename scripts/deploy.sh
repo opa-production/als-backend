@@ -290,17 +290,52 @@ echo "==> alembic upgrade head"
 # the .env was removed, DATABASE_URL fell back to the built-in default and
 # alembic tried localhost:5432, on a box whose database is in another country.
 #
-# Read in a subshell-free block with `set -a` so exported values reach alembic,
-# then turned straight back off. `set +u` around the source is deliberate: the
-# file is operator-edited and a stray bare word should not abort the deploy
-# under `set -u`.
+# Parsed, never sourced. `.` would let the shell evaluate the file, and these
+# values are not shell -- a database password containing a backtick or $( turns
+# into a command substitution and the deploy dies with "No such file or
+# directory" naming a fragment of the password. systemd does not evaluate this
+# file either, which is why the service was fine while the deploy was not.
+#
+# So: split on the first `=`, strip one matching pair of surrounding quotes the
+# way systemd does, and export the value verbatim.
+load_env_file() {
+    local file="$1" line key value
+    local cr
+    cr=$(printf '\r')
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%"$cr"}"           # tolerate a CRLF file
+        line="${line#export }"        # and a leading `export `
+        case "$line" in
+            '' | '#'*) continue ;;
+            *=*) ;;
+            *) continue ;;
+        esac
+
+        key="${line%%=*}"
+        value="${line#*=}"
+
+        # Anything whose key is not an identifier is not a settings line.
+        case "$key" in
+            '' | *[!A-Za-z0-9_]*) continue ;;
+        esac
+
+        # One matching pair of surrounding quotes, stripped the way systemd
+        # does. The length guard is not decoration: a bare `*` matches the
+        # single-quote pattern otherwise, and the substring arithmetic then
+        # goes negative and aborts the whole loop under `set -e`.
+        if [ ${#value} -ge 2 ]; then
+            case "$value" in
+                '"'*'"') value="${value:1:${#value}-2}" ;;
+                "'"*"'") value="${value:1:${#value}-2}" ;;
+            esac
+        fi
+
+        export "$key=$value"
+    done < "$file"
+}
+
 if [ -r "$ENV_FILE" ]; then
-    set -a
-    set +u
-    # shellcheck disable=SC1090
-    . "$ENV_FILE"
-    set -u
-    set +a
+    load_env_file "$ENV_FILE"
 else
     echo "!! $ENV_FILE is not readable by $(id -un)." >&2
     echo "" >&2
@@ -311,8 +346,8 @@ else
     echo "!! The file is root-owned by design. Give this account read access" >&2
     echo "!! through the group rather than making it world-readable:" >&2
     echo "" >&2
-    echo "!!     sudo chown root:$(id -gn) $ENV_FILE" >&2
-    echo "!!     sudo chmod 640 $ENV_FILE" >&2
+    echo "!!     sudo usermod -aG als $(id -un)" >&2
+    echo "!!     sudo chown root:als $ENV_FILE && sudo chmod 640 $ENV_FILE" >&2
     exit 1
 fi
 

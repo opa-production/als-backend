@@ -131,8 +131,19 @@ def create_app() -> FastAPI:
         try:
             async with engine.connect() as connection:
                 await connection.execute(text("SELECT 1"))
-        except Exception:
-            log.warning("readiness_database_unreachable")
+        except Exception as exc:
+            # The class and message go to the journal, never to the response.
+            # Logging only the event name once cost an afternoon: the service
+            # reported `database: false` while the identical connection string
+            # succeeded from a shell, and the one fact that would have told us
+            # why — DNS failure, refused, bad password — was being discarded
+            # here. The body stays deliberately bare; an unauthenticated probe
+            # should not be able to read the database hostname back out.
+            log.warning(
+                "readiness_database_unreachable",
+                error=type(exc).__name__,
+                detail=str(exc)[:200],
+            )
             return JSONResponse(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 content={"status": "unavailable", "database": False},

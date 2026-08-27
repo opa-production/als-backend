@@ -252,6 +252,17 @@ guard that refuses a default `JWT_SECRET`, so put it back.
 
 ### When a deploy fails
 
+First, ask the server. `scripts/doctor.sh` checks everything section 2 sets up
+and prints the fix for whatever is missing:
+
+```bash
+ssh als@als.ardena.xyz 'bash -s' < scripts/doctor.sh
+```
+
+It is read-only, needs no sudo, and always exits 0. Run it before reading logs —
+most deploy failures here have been one missing package, one missing sudoers
+line, or a checkout the running service was never using, and this names which.
+
 `scripts/deploy.sh` will not leave a broken service running. If `/health` does
 not answer within 30 seconds of the restart it resets the checkout to the
 previous commit, reinstalls and restarts, then exits non-zero so the Actions run

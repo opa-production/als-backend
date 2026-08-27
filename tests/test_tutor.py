@@ -598,3 +598,64 @@ async def test_a_provider_failure_arrives_as_an_error_frame(client, fake_model, 
 
     assert "error" in names
     assert "busy" in frames[-1][1]["message"]
+
+
+async def test_the_turn_is_stored_under_the_ids_the_device_chose(client, fake_model):
+    """
+    The device and the server must describe the same two rows.
+
+    Each minting its own ids meant the next sync pulled the server's pair down
+    as *extra* messages, so every answer appeared in the thread twice — as
+    though the question had been asked twice.
+    """
+    from sqlalchemy import select
+
+    from app.models.tutor import Message as MessageRow
+
+    headers, _ = await sign_in(client)
+
+    chat_id = uuid.uuid4()
+    student_id = uuid.uuid4()
+    answer_id = uuid.uuid4()
+
+    response = await client.post(
+        "/api/v1/tutor/ask",
+        json={
+            "question": "What is photosynthesis?",
+            "chat_id": str(chat_id),
+            "student_message_id": str(student_id),
+            "answer_message_id": str(answer_id),
+        },
+        headers=headers,
+    )
+    assert response.status_code == 200
+
+    meta = next(payload for name, payload in _frames(response.text) if name == "meta")
+    assert meta["student_message_id"] == str(student_id)
+    assert meta["answer_message_id"] == str(answer_id)
+
+    async with client.sessions() as session:
+        rows = (
+            await session.scalars(
+                select(MessageRow).where(MessageRow.chat_id == chat_id)
+            )
+        ).all()
+
+    ids = {row.id for row in rows}
+    assert student_id in ids, "the question was stored under a server-minted id"
+    assert answer_id in ids, "the answer was stored under a server-minted id"
+    assert len(rows) == 2, f"expected exactly the two turns, got {len(rows)}"
+
+
+async def test_ids_are_still_minted_when_the_client_sends_none(client, fake_model):
+    """An older build must keep working, and must be told which ids were used."""
+    headers, _ = await sign_in(client)
+
+    response = await client.post(
+        "/api/v1/tutor/ask", json={"question": "hello"}, headers=headers
+    )
+    assert response.status_code == 200
+
+    meta = next(payload for name, payload in _frames(response.text) if name == "meta")
+    assert uuid.UUID(meta["student_message_id"])
+    assert uuid.UUID(meta["answer_message_id"])

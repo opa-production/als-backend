@@ -81,6 +81,20 @@ class AskRequest(BaseModel):
     #: Omit to take the server's default. An unavailable choice falls back
     #: rather than failing, and the stream says which model actually answered.
     model: str | None = None
+    #: The ids the device used for this turn, so the two sides describe the
+    #: same two rows rather than each inventing their own.
+    #:
+    #: Without these the server saved the question and the answer under ids the
+    #: device had never seen, the device saved them under ids the server had
+    #: never seen, and the next sync pulled the server's pair down as *extra*
+    #: messages -- so every answer appeared twice, as though the question had
+    #: been asked twice.
+    #:
+    #: Optional, so an older build still works: the server mints them when they
+    #: are absent and reports both in the `meta` frame, which lets a client
+    #: adopt them instead of minting its own.
+    student_message_id: uuid.UUID | None = None
+    answer_message_id: uuid.UUID | None = None
 
 
 class SourceOut(BaseModel):
@@ -237,12 +251,15 @@ async def ask(
         model_id=payload.model,
     )
 
+    student_message_id = payload.student_message_id or uuid.uuid4()
+    answer_message_id = payload.answer_message_id or uuid.uuid4()
+
     # Recorded before the answer exists. The student's turn is a fact whether or
     # not the tutor manages to reply, and a question with no row is a
     # conversation with a hole in it.
     session.add(
         MessageRow(
-            id=uuid.uuid4(),
+            id=student_message_id,
             chat_id=chat.id,
             user_id=user.id,
             role="student",
@@ -269,6 +286,8 @@ async def ask(
             "meta",
             {
                 "chat_id": str(chat.id),
+                "student_message_id": str(student_message_id),
+                "answer_message_id": str(answer_message_id),
                 "model": plan.spec.id,
                 "model_label": plan.spec.label,
                 "mode": plan.mode,
@@ -297,7 +316,9 @@ async def ask(
 
         answer = "".join(collected).strip()
         if answer:
-            await _save_answer(session, chat, user.id, plan, answer)
+            await _save_answer(
+                session, chat, user.id, plan, answer, message_id=answer_message_id
+            )
 
         yield _event("done", {"text": answer})
 
@@ -316,7 +337,13 @@ async def ask(
 
 
 async def _save_answer(
-    session: DbSession, chat: Chat, user_id: uuid.UUID, plan: pipeline.Plan, answer: str
+    session: DbSession,
+    chat: Chat,
+    user_id: uuid.UUID,
+    plan: pipeline.Plan,
+    answer: str,
+    *,
+    message_id: uuid.UUID,
 ) -> None:
     """
     Store the reply, with what it was built from.
@@ -330,7 +357,7 @@ async def _save_answer(
     try:
         session.add(
             MessageRow(
-                id=uuid.uuid4(),
+                id=message_id,
                 chat_id=chat.id,
                 user_id=user_id,
                 role="tutor",

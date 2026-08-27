@@ -114,6 +114,45 @@ async def activate(
     return subscription
 
 
+async def record_pending_payment(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    reference: str,
+    tier: Tier,
+    amount_kes: int,
+) -> Payment:
+    """
+    Notes that a charge was started, before anyone knows whether it succeeded.
+
+    The row exists so an unconfirmed payment is *visible*. Without it the
+    console cannot tell "nobody tried to pay" from "somebody paid and the
+    webhook never arrived", and the admin reconcile endpoint has nothing to act
+    on, because it looks payments up by reference.
+
+    Idempotent: references are minted per checkout, but a retried request must
+    not raise on the unique index.
+    """
+    existing = await session.scalar(
+        select(Payment).where(Payment.reference == reference)
+    )
+    if existing is not None:
+        return existing
+
+    payment = Payment(
+        user_id=user_id,
+        reference=reference,
+        tier=tier.value,
+        amount_kes=amount_kes,
+        status="pending",
+        channel="",
+        paid_at=None,
+    )
+    session.add(payment)
+    await session.flush()
+    return payment
+
+
 async def record_payment(
     session: AsyncSession, *, user_id: uuid.UUID, charge: Charge, tier: Tier
 ) -> tuple[Payment, bool]:
@@ -127,8 +166,29 @@ async def record_payment(
     existing = await session.scalar(
         select(Payment).where(Payment.reference == charge.reference)
     )
+
     if existing is not None:
-        return existing, False
+        # Already credited: a repeat webhook, or a reconcile after the fact.
+        if existing.status == "success":
+            return existing, False
+
+        # The pending row written when checkout started, now answered. Kora is
+        # the authority on what happened, so its verdict is copied over --
+        # including a failure, which is worth recording rather than leaving the
+        # row to sit as "pending" forever.
+        existing.status = charge.status
+        existing.amount_kes = charge.amount_kes
+        existing.channel = charge.channel or existing.channel
+
+        if charge.status != "success":
+            await session.flush()
+            return existing, False
+
+        existing.paid_at = utc_now()
+        await session.flush()
+        # True, because the plan has not been credited yet: this is the call
+        # that must activate it.
+        return existing, True
 
     payment = Payment(
         user_id=user_id,

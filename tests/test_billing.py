@@ -294,8 +294,35 @@ class _FakeKora:
 
     def __init__(self):
         self.payload = None
+        #: What a later verify should report. Tests that only exercise checkout
+        #: never look at it.
+        self.verify_status = "success"
+        self.verify_amount = None
 
     def handle(self, request: httpx.Request) -> httpx.Response:
+        # Verifying a reference is a GET with no body; creating a charge is a
+        # POST with one. Branching on the method keeps both in one fake.
+        if request.method == "GET":
+            reference = str(request.url).rstrip("/").rsplit("/", 1)[-1]
+            amount = self.verify_amount
+            if amount is None:
+                amount = (self.payload or {}).get("amount", 0)
+            return httpx.Response(
+                200,
+                json={
+                    "status": True,
+                    "message": "Charge retrieved",
+                    "data": {
+                        "reference": reference,
+                        "status": self.verify_status,
+                        "amount": amount,
+                        "currency": "KES",
+                        "payment_method": "mobile_money",
+                        "metadata": (self.payload or {}).get("metadata", {}),
+                    },
+                },
+            )
+
         self.payload = json.loads(request.content)
         return httpx.Response(
             200,
@@ -546,3 +573,78 @@ async def test_someone_elses_group_is_not_yours_to_manage(client):
     assert (
         await client.get("/api/v1/billing/group", headers=stranger_headers)
     ).status_code == 404
+
+
+async def test_checkout_leaves_a_pending_payment_to_find(client, kora):
+    """
+    A charge that is started must be visible before it is confirmed.
+
+    Without this row an unconfirmed payment left no trace at all: nothing in the
+    console, and the admin reconcile endpoint useless because it looks payments
+    up by reference. The first real payment on this system landed in exactly
+    that gap — money taken, no record, nothing anyone could press.
+    """
+    from sqlalchemy import select
+
+    from app.models.billing import Payment
+
+    headers, user_id = await sign_in(client)
+
+    started = await client.post(
+        "/api/v1/billing/checkout", json={"tier": "pro"}, headers=headers
+    )
+    assert started.status_code == 200
+    reference = started.json()["reference"]
+
+    async with client.sessions() as session:
+        payment = await session.scalar(
+            select(Payment).where(Payment.reference == reference)
+        )
+
+    assert payment is not None, "checkout recorded nothing to reconcile against"
+    assert payment.status == "pending"
+    assert payment.user_id == user_id
+    assert payment.amount_kes == plan_for(Tier.PRO).price_ksh
+    assert payment.paid_at is None
+
+
+async def test_confirming_a_pending_payment_activates_the_plan(client, kora):
+    """
+    The pending row must not swallow the confirmation.
+
+    `record_payment` returns an existing row untouched, which is what makes
+    Kora's repeat deliveries safe. A pending row written at checkout would sit
+    in that same path — so without the amendment, adding the row would have
+    stopped every plan activating.
+    """
+    from sqlalchemy import select
+
+    from app.models.billing import Payment
+
+    headers, _ = await sign_in(client)
+
+    started = await client.post(
+        "/api/v1/billing/checkout", json={"tier": "pro"}, headers=headers
+    )
+    reference = started.json()["reference"]
+
+    verified = await client.post(
+        "/api/v1/billing/verify", json={"reference": reference}, headers=headers
+    )
+    assert verified.status_code == 200, verified.text
+
+    subscription = (
+        await client.get("/api/v1/billing/subscription", headers=headers)
+    ).json()
+    assert subscription["tier"] == "pro", "the plan never activated"
+
+    async with client.sessions() as session:
+        rows = (
+            await session.scalars(
+                select(Payment).where(Payment.reference == reference)
+            )
+        ).all()
+
+    assert len(rows) == 1, "the pending row should be filled in, not duplicated"
+    assert rows[0].status == "success"
+    assert rows[0].paid_at is not None

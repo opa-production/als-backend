@@ -206,6 +206,25 @@ async def start_checkout(
         notification_url=settings.webhook_url or None,
     )
 
+    # Recorded now, as pending, rather than only when Kora confirms it.
+    #
+    # Until this existed a charge that was started and never confirmed left no
+    # trace at all: nothing in the console, nothing to reconcile, and no way to
+    # tell "nobody tried to pay" from "somebody paid and we never heard".
+    # The first real payment on this system landed in exactly that gap -- money
+    # taken, no row, and the admin reconcile button useless because it needs a
+    # row to act on.
+    #
+    # record_payment fills this row in when the webhook or a verify arrives.
+    await billing_service.record_pending_payment(
+        session,
+        user_id=user.id,
+        reference=checkout.reference,
+        tier=tier,
+        amount_kes=plan.price_ksh,
+    )
+    await session.commit()
+
     log.info(
         "checkout_started",
         user_id=str(user.id),

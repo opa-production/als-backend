@@ -659,3 +659,48 @@ async def test_ids_are_still_minted_when_the_client_sends_none(client, fake_mode
     meta = next(payload for name, payload in _frames(response.text) if name == "meta")
     assert uuid.UUID(meta["student_message_id"])
     assert uuid.UUID(meta["answer_message_id"])
+
+
+async def test_asking_with_ids_that_already_exist_is_not_an_error(client, fake_model):
+    """
+    The row may already be there when /tutor/ask writes it.
+
+    Two ordinary ways: the app pushes the question through /sync while the
+    answer is still streaming, and askTutor retries the whole request after a
+    401 with the same pair of ids. A blind INSERT then violates pk_messages and
+    loses an answer the student has already read — which is what
+    `duplicate key value violates unique constraint "pk_messages"` in the
+    journal was.
+    """
+    from sqlalchemy import select
+
+    from app.models.tutor import Message as MessageRow
+
+    headers, _ = await sign_in(client)
+
+    chat_id = uuid.uuid4()
+    student_id = uuid.uuid4()
+    answer_id = uuid.uuid4()
+    body = {
+        "question": "What is a deadlock?",
+        "chat_id": str(chat_id),
+        "student_message_id": str(student_id),
+        "answer_message_id": str(answer_id),
+    }
+
+    first = await client.post("/api/v1/tutor/ask", json=body, headers=headers)
+    assert first.status_code == 200
+
+    # The same request again, exactly as a 401 retry would send it.
+    second = await client.post("/api/v1/tutor/ask", json=body, headers=headers)
+    assert second.status_code == 200, second.text
+    assert "integrity" not in second.text.lower()
+
+    async with client.sessions() as session:
+        rows = (
+            await session.scalars(
+                select(MessageRow).where(MessageRow.chat_id == chat_id)
+            )
+        ).all()
+
+    assert len(rows) == 2, f"the turn should exist once, found {len(rows)} rows"

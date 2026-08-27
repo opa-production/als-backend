@@ -26,6 +26,7 @@ from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import CurrentUser, DbSession
 from app.core.errors import AppError
@@ -146,6 +147,57 @@ def _event(name: str, payload: dict) -> str:
     return f"event: {name}\ndata: {json.dumps(payload, default=str)}\n\n"
 
 
+async def _record_message(
+    session: DbSession,
+    *,
+    message_id: uuid.UUID,
+    chat: Chat,
+    user_id: uuid.UUID,
+    role: str,
+    content: str,
+    **extra: object,
+) -> None:
+    """
+    Write a turn under an id the device chose, at most once.
+
+    The id being client-minted is what stops the answer appearing twice — but
+    it also means the row may already exist by the time this runs. Two ordinary
+    ways: the app pushes the question through /sync while the answer is still
+    streaming, and `askTutor` retries the whole request after a 401 with the
+    same pair of ids. A blind INSERT then violates pk_messages and loses an
+    answer the student has already read.
+
+    So this is an upsert in spirit: look first, and insert inside a savepoint so
+    a row that appears between the check and the write is a no-op rather than an
+    aborted transaction. The existing row is left alone — it says the same
+    thing, and the device's copy is the one the student is looking at.
+    """
+    existing = await session.scalar(
+        select(MessageRow).where(
+            MessageRow.id == message_id, MessageRow.user_id == user_id
+        )
+    )
+    if existing is not None:
+        return
+
+    try:
+        async with session.begin_nested():
+            session.add(
+                MessageRow(
+                    id=message_id,
+                    chat_id=chat.id,
+                    user_id=user_id,
+                    role=role,
+                    content=content,
+                    **extra,
+                )
+            )
+            await session.flush()
+    except IntegrityError:
+        # Written between the check and the insert. Nothing to do.
+        log.info("message_already_recorded", message_id=str(message_id), role=role)
+
+
 async def _load_history(
     session: DbSession, chat_id: uuid.UUID | None, user_id: uuid.UUID
 ) -> list[Message]:
@@ -257,14 +309,13 @@ async def ask(
     # Recorded before the answer exists. The student's turn is a fact whether or
     # not the tutor manages to reply, and a question with no row is a
     # conversation with a hole in it.
-    session.add(
-        MessageRow(
-            id=student_message_id,
-            chat_id=chat.id,
-            user_id=user.id,
-            role="student",
-            content=payload.question,
-        )
+    await _record_message(
+        session,
+        message_id=student_message_id,
+        chat=chat,
+        user_id=user.id,
+        role="student",
+        content=payload.question,
     )
     await record_usage(session, user.id, "ai_queries")
     await session.commit()
@@ -355,26 +406,25 @@ async def _save_answer(
     usage = pipeline.estimate_usage(prompt_text, answer)
 
     try:
-        session.add(
-            MessageRow(
-                id=message_id,
-                chat_id=chat.id,
-                user_id=user_id,
-                role="tutor",
-                content=answer,
-                sources=[
-                    {
-                        "material_id": str(passage.material_id),
-                        "title": passage.title,
-                        "page_number": passage.page_number,
-                    }
-                    for passage in plan.passages
-                ]
-                or None,
-                prompt_tokens=usage.prompt_tokens,
-                completion_tokens=usage.completion_tokens,
-                model=plan.spec.id,
-            )
+        await _record_message(
+            session,
+            message_id=message_id,
+            chat=chat,
+            user_id=user_id,
+            role="tutor",
+            content=answer,
+            sources=[
+                {
+                    "material_id": str(passage.material_id),
+                    "title": passage.title,
+                    "page_number": passage.page_number,
+                }
+                for passage in plan.passages
+            ]
+            or None,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            model=plan.spec.id,
         )
         await session.commit()
     except Exception:  # noqa: BLE001

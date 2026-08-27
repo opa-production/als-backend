@@ -1,4 +1,26 @@
-# Local development only. Production runs the image against managed Postgres.
+# Local development only. Never on a server.
+#
+# This file used to say that in a comment, and a comment did not stop it being
+# run on the production box — where it took port 8000 ahead of the systemd unit,
+# forced ENVIRONMENT=development and DEBUG=true over the real secrets file, and
+# published a Postgres with the password `als` to 0.0.0.0:5432. Every deploy for
+# days updated a checkout that nothing loaded.
+#
+# So the guard is mechanical now, not advisory:
+#
+#   * every published port binds to 127.0.0.1, so nothing here is reachable
+#     from outside the machine even if it is started by mistake;
+#   * ALS_LOCAL must be set, or compose refuses to parse the file at all.
+#
+# To use it:
+#
+#     ALS_LOCAL=1 docker compose up
+#     ALS_LOCAL=1 docker compose down
+#
+# Production runs the systemd units against managed Postgres. See DEPLOYMENT.md.
+
+name: als-backend-local
+
 services:
   db:
     image: postgres:16-alpine
@@ -6,8 +28,13 @@ services:
       POSTGRES_USER: als
       POSTGRES_PASSWORD: als
       POSTGRES_DB: als
+      # Interpolated on every compose command, so an unset ALS_LOCAL stops
+      # `up` before a container is created rather than after.
+      ALS_LOCAL: ${ALS_LOCAL:?refusing to run - docker-compose.yml is for local development only. Set ALS_LOCAL=1 if this really is your laptop. On a server, use the systemd units (DEPLOYMENT.md section 2).}
     ports:
-      - "5432:5432"
+      # 127.0.0.1 prefix deliberate: a throwaway password is fine on a laptop
+      # loopback and catastrophic on a public interface.
+      - "127.0.0.1:5432:5432"
     volumes:
       - als-postgres:/var/lib/postgresql/data
     healthcheck:
@@ -25,12 +52,15 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql+asyncpg://als:als@db:5432/als
+      # These override anything in .env, which is the point locally and was the
+      # problem on the server. Loopback-only binding is what makes it safe.
       ENVIRONMENT: development
       DEBUG: "true"
+      ALS_LOCAL: ${ALS_LOCAL:?refusing to run - see the note in this file}
     env_file:
       - .env
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       - .:/app
     command: >

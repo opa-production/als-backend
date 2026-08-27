@@ -98,15 +98,26 @@ sudo -u als /opt/als-backend/.venv/bin/pip install /opt/als-backend
 `deploy.sh` builds one if it is missing, so this is a convenience rather than a
 requirement.
 
-**The secrets file**, at `/etc/als-backend/env`, root-owned and `0600` — outside
-the git tree, so a bad checkout can never expose it. Copy `.env.example` and
-fill it in; that file documents every variable and what breaks without it.
+**The secrets file**, at `/etc/als-backend/env` — outside the git tree, so a bad
+checkout can never expose it. Copy `.env.example` and fill it in; that file
+documents every variable and what breaks without it.
 
 ```bash
 sudo install -d -m 755 /etc/als-backend
-sudo install -m 600 /dev/null /etc/als-backend/env
+sudo install -m 640 -o root -g als /dev/null /etc/als-backend/env
 sudo nano /etc/als-backend/env
 ```
+
+Root-owned, group `als`, `0640`. Not `0600`: `deploy.sh` sources this file
+before running migrations, as the deploy account, and a file only root can read
+sends alembic to the built-in default connection string — `localhost` — on a box
+whose database is somewhere else entirely. Group-readable rather than
+world-readable is the difference that matters.
+
+**Never put a `.env` inside `/opt/als-backend`.** pydantic-settings reads it from
+the working directory, so a stray copy silently overrides this file for anything
+run by hand — and `deploy.sh` does `git reset --hard`, so the two disagree the
+moment someone edits the wrong one. One file, one place.
 
 **The systemd units.** Both live in `deploy/` in this repo and are installed
 from the checkout, so editing them there and copying is the whole update path:

@@ -19,6 +19,11 @@ SERVICE=als-backend
 #: API is what serves students.
 WORKER=als-worker
 
+#: The operator-managed settings file, outside the git tree so a bad checkout
+#: can never expose it. systemd hands it to the service; this script has to
+#: source it itself before running migrations.
+ENV_FILE=/etc/als-backend/env
+
 # --- Running from an immutable copy -------------------------------------------
 #
 # This script replaces itself part-way through: `git reset --hard` below rewrites
@@ -276,6 +281,41 @@ echo "==> alembic upgrade head"
 # Migrations run before the restart, while the old code is still serving. That
 # is only safe for additive changes -- a column dropped here breaks the running
 # process instantly. See the note in alembic/script.py.mako.
+#
+# The settings file has to be loaded explicitly. The service gets it from
+# systemd's EnvironmentFile, but this script is a plain SSH session and gets
+# nothing. For a long time that went unnoticed because a stray .env sat in the
+# checkout and pydantic-settings picked it up from the working directory --
+# so migrations were quietly running against whatever *that* file said. When
+# the .env was removed, DATABASE_URL fell back to the built-in default and
+# alembic tried localhost:5432, on a box whose database is in another country.
+#
+# Read in a subshell-free block with `set -a` so exported values reach alembic,
+# then turned straight back off. `set +u` around the source is deliberate: the
+# file is operator-edited and a stray bare word should not abort the deploy
+# under `set -u`.
+if [ -r "$ENV_FILE" ]; then
+    set -a
+    set +u
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set -u
+    set +a
+else
+    echo "!! $ENV_FILE is not readable by $(id -un)." >&2
+    echo "" >&2
+    echo "!! Migrations would otherwise run against the built-in default" >&2
+    echo "!! connection string -- localhost -- which is not this project's" >&2
+    echo "!! database. Refusing rather than guessing." >&2
+    echo "" >&2
+    echo "!! The file is root-owned by design. Give this account read access" >&2
+    echo "!! through the group rather than making it world-readable:" >&2
+    echo "" >&2
+    echo "!!     sudo chown root:$(id -gn) $ENV_FILE" >&2
+    echo "!!     sudo chmod 640 $ENV_FILE" >&2
+    exit 1
+fi
+
 .venv/bin/alembic upgrade head
 
 # --- Restarting without root --------------------------------------------------

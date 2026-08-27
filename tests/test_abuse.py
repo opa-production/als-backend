@@ -353,3 +353,78 @@ async def test_joining_a_group_does_not_trample_a_plan_you_paid_for(client):
     ).json()
     assert body["tier"] == "pro"
     assert body["days_remaining"] >= plan_for(Tier.PRO).duration_days - 1
+
+
+async def test_a_counter_collision_does_not_poison_the_transaction():
+    """
+    Two requests creating the same period's counter must not abort the
+    surrounding transaction.
+
+    On Postgres a unique violation poisons the whole transaction and every
+    later statement fails with InFailedSQLTransactionError naming an innocent
+    query. In production that surfaced as the AI refusing, with a traceback
+    pointing at a plain SELECT on usage_counters -- the victim, not the cause.
+
+    Builds its own engine rather than going through `client`, because what is
+    under test is a session, not an endpoint.
+    """
+    import uuid as _uuid
+    from datetime import date
+
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.db.base import Base
+    from app.models.billing import UsageCounter
+    from app.services import quota
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    user_id = _uuid.uuid4()
+    period = quota.METRIC_PERIODS["ai_queries"]()
+
+    try:
+        async with sessions() as session:
+            # Stand in for the request that got there first.
+            session.add(
+                UsageCounter(
+                    user_id=user_id,
+                    metric="ai_queries",
+                    period_key=period,
+                    count=1,
+                    period_date=date.today(),
+                )
+            )
+            await session.flush()
+
+            # Force the "no row yet" path even though one exists — exactly what
+            # the losing request of a race sees.
+            original = quota._counter
+            calls = {"n": 0}
+
+            async def _blind_once(inner, uid, metric, key):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return None
+                return await original(inner, uid, metric, key)
+
+            quota._counter = _blind_once
+            try:
+                total = await quota.record_usage(session, user_id, "ai_queries")
+            finally:
+                quota._counter = original
+
+            assert total == 2, "the collision should have added to the existing row"
+
+            # The transaction must still be usable. This is the regression.
+            rows = (
+                await session.scalars(
+                    select(UsageCounter).where(UsageCounter.user_id == user_id)
+                )
+            ).all()
+            assert len(rows) == 1
+    finally:
+        await engine.dispose()

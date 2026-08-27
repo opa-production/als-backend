@@ -310,3 +310,43 @@ async def test_a_genuinely_malformed_since_is_still_rejected(client):
     bad = await client.get("/api/v1/sync?since=not-a-date", headers=headers)
     assert bad.status_code == 422
     assert "since" in bad.json()["message"]
+
+
+async def test_a_long_title_is_clipped_rather_than_failing_the_whole_push(client):
+    """
+    Sync is all-or-nothing, so one overlong title used to 422 the entire batch.
+
+    A device with a single bad material then synced nothing at all, forever --
+    retrying every few seconds and failing identically each time. In production
+    that showed up as `materials.0.title: String should have at most 300
+    characters`, repeating in the log.
+    """
+    headers, _ = await sign_in(client)
+
+    unit = _unit()
+    await client.post("/api/v1/sync", json={"units": [unit]}, headers=headers)
+
+    long_title = "A" * 450
+    pushed = await client.post(
+        "/api/v1/sync",
+        json={
+            "materials": [
+                {
+                    "id": str(uuid.uuid4()),
+                    "unit_id": unit["id"],
+                    "kind": "note",
+                    "title": long_title,
+                    "body": "",
+                    "archived": False,
+                    "updated_at": datetime.now(UTC).isoformat(),
+                    "deleted_at": None,
+                }
+            ]
+        },
+        headers=headers,
+    )
+    assert pushed.status_code == 200, pushed.text
+
+    materials = (await client.get("/api/v1/sync", headers=headers)).json()["materials"]
+    assert len(materials) == 1
+    assert materials[0]["title"] == "A" * 300

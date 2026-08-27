@@ -1,7 +1,36 @@
 import uuid
 from datetime import datetime, time
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+
+
+def _clip(limit: int):
+    """
+    A title too long trims instead of failing the whole push.
+
+    Sync is all-or-nothing: one bad row 422s the entire batch, so a single
+    material whose title came from a long filename stopped a device syncing
+    anything at all, forever. It retried every few seconds and failed the
+    same way each time.
+
+    Titles are display strings, not data anyone computes on, so clipping one
+    is a smaller harm than blocking every note, event and chat behind it.
+    This is deliberately not applied to ids, timestamps or foreign keys --
+    those must still be rejected loudly, because guessing at them corrupts
+    the very thing sync exists to protect.
+    """
+
+    def clip(value: object) -> object:
+        if isinstance(value, str) and len(value) > limit:
+            return value[:limit]
+        return value
+
+    return BeforeValidator(clip)
+
+
+#: Titles arrive from filenames and user typing, and both overrun.
+Title300 = Annotated[str, _clip(300), Field(max_length=300)]
 
 
 class SyncRow(BaseModel):
@@ -37,14 +66,14 @@ class ClassSessionIn(SyncRow):
 class MaterialIn(SyncRow):
     unit_id: uuid.UUID
     kind: str = Field(default="note", max_length=16)
-    title: str = Field(max_length=300)
+    title: Title300
     body: str = ""
     archived: bool = False
 
 
 class EventIn(SyncRow):
     unit_id: uuid.UUID | None = None
-    title: str = Field(max_length=300)
+    title: Title300
     kind: str = Field(default="assignment", max_length=16)
     label: str = Field(default="", max_length=80)
     due_at: datetime | None = None

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.clock import as_utc
@@ -153,19 +154,44 @@ async def record_usage(
     period = METRIC_PERIODS[metric]()
     row = await _counter(session, user_id, metric, period)
 
-    if row is None:
-        row = UsageCounter(
-            user_id=user_id,
-            metric=metric,
-            period_key=period,
-            count=amount,
-            period_date=date.today(),
-        )
-        session.add(row)
-    else:
+    if row is not None:
         row.count += amount
+        await session.flush()
+        return row.count
 
-    await session.flush()
+    # First use of this metric in this period. Two concurrent requests both
+    # reach here, and the unique constraint decides which one wins.
+    #
+    # The savepoint is the whole point. Without it the loser's INSERT raises
+    # inside the *outer* transaction, and Postgres then refuses every
+    # subsequent statement on that connection with
+    #
+    #     InFailedSQLTransactionError: current transaction is aborted,
+    #     commands ignored until end of transaction block
+    #
+    # The traceback that surfaces names whatever query ran next -- a harmless
+    # SELECT on usage_counters -- so the report points at the victim rather
+    # than at the cause. A nested block rolls back to the savepoint instead,
+    # leaving the surrounding transaction healthy.
+    try:
+        async with session.begin_nested():
+            row = UsageCounter(
+                user_id=user_id,
+                metric=metric,
+                period_key=period,
+                count=amount,
+                period_date=date.today(),
+            )
+            session.add(row)
+            await session.flush()
+    except IntegrityError:
+        # The other request created it. Read it back and add to it.
+        row = await _counter(session, user_id, metric, period)
+        if row is None:
+            raise  # Not the collision we assumed; do not swallow it.
+        row.count += amount
+        await session.flush()
+
     return row.count
 
 

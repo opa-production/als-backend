@@ -25,6 +25,19 @@ Environment=WEB_CONCURRENCY=2
 # Secrets live outside the git working tree, root-owned and 0600, so a bad
 # checkout or a world-readable repo can never expose them.
 EnvironmentFile=/etc/als-backend/env
+# ProtectHome=true below makes /home unreadable, and asyncpg reacts badly to
+# that. Whenever TLS is in play it computes a default client-key path of
+# $HOME/.postgresql/postgresql.key and calls .exists() on it -- which raises
+# PermissionError rather than returning False, so the connection dies before a
+# socket is ever opened. The symptom is maddening: the service reports the
+# database unreachable in ~100ms while the identical URL connects fine from a
+# shell, because a shell is not sandboxed.
+#
+# Pointing HOME at the app directory fixes it without weakening the sandbox:
+# the path is stattable, .postgresql simply is not there, and .exists() answers
+# False the way asyncpg expects. Do not "fix" this by relaxing ProtectHome.
+Environment=HOME=/opt/als-backend
+
 
 # --proxy-headers with a localhost-only trust list: nginx is the only thing
 # that may set X-Forwarded-For. Trusting every peer would let any client forge

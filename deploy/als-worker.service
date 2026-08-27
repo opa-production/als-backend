@@ -24,6 +24,19 @@ WorkingDirectory=/opt/als-backend
 # The same secrets file as the API. It needs the database and Supabase; it
 # never touches Kora or the AI keys.
 EnvironmentFile=/etc/als-backend/env
+# ProtectHome=true below makes /home unreadable, and asyncpg reacts badly to
+# that. Whenever TLS is in play it computes a default client-key path of
+# $HOME/.postgresql/postgresql.key and calls .exists() on it -- which raises
+# PermissionError rather than returning False, so the connection dies before a
+# socket is ever opened. The symptom is maddening: the service reports the
+# database unreachable in ~100ms while the identical URL connects fine from a
+# shell, because a shell is not sandboxed.
+#
+# Pointing HOME at the app directory fixes it without weakening the sandbox:
+# the path is stattable, .postgresql simply is not there, and .exists() answers
+# False the way asyncpg expects. Do not "fix" this by relaxing ProtectHome.
+Environment=HOME=/opt/als-backend
+
 
 ExecStart=/opt/als-backend/.venv/bin/python -m app.workers.runner
 

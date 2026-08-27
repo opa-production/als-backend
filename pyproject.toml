@@ -46,8 +46,14 @@ dev = [
 # `app` is the only importable package. Without this, setuptools tries to
 # auto-discover and gives up on a tree that also holds alembic/, tests/ and
 # scripts/ at the top level.
-[tool.setuptools]
-packages = ["app"]
+[tool.setuptools.packages.find]
+# `packages = ["app"]` installs the top-level package and none of its
+# subpackages, so site-packages ends up with app/ but no app.db, app.api or
+# app.services. Nothing noticed for a long time: uvicorn and pytest both put the
+# working directory on sys.path, so the source tree shadowed the broken install
+# every time it mattered. It surfaced the first time something ran from another
+# directory -- scripts/create_admin.py -- as ModuleNotFoundError: app.db.
+include = ["app*"]
 
 [tool.ruff]
 line-length = 96

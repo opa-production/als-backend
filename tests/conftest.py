@@ -68,6 +68,21 @@ async def client():
     await engine.dispose()
 
 
+async def give_plan(client, user_id, tier):
+    """
+    Puts an account on a paid plan.
+
+    Free allows one course unit, which is deliberate and is the wrong subject
+    for a test about something else -- a sync cursor, say. This keeps the cap
+    out of the way of tests that are not about the cap.
+    """
+    from app.services.billing import activate
+
+    async with client.sessions() as session:
+        await activate(session, user_id=user_id, tier=tier, verified=True)
+        await session.commit()
+
+
 async def sign_in(client, phone=PHONE):
     """Signs a student in and returns ready-to-use auth headers."""
     sent = await client.post("/api/v1/auth/otp", json={"phone": phone})

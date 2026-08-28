@@ -159,6 +159,11 @@ async def subscription_stats(session: DbSession) -> SubscriptionStatsOut:
             session, Subscription, *analytics.active_subscription_filter(now)
         ),
         total_paying=sum(row.paying for row in plans),
+        total_free=await analytics.count_rows(
+            session,
+            Subscription,
+            Subscription.tier == Tier.FREE.value,
+        ),
         total_trial=await analytics.count_rows(
             session,
             Subscription,

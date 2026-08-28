@@ -200,7 +200,7 @@ async def list_users(
         expires = as_utc(subscription.expires_at) if subscription else None
         lapsed = expires is None or expires <= now
         effective = (
-            Tier.EXPIRED.value
+            Tier.FREE.value
             if subscription is None or lapsed or not subscription.verified
             else subscription.tier
         )
@@ -426,9 +426,11 @@ async def grant_subscription(
     # accounting honest — otherwise a granted plan looks like a paid group's
     # member and the group's revenue attribution silently gains a person.
     subscription.group_id = None
-    subscription.verified = tier is not Tier.EXPIRED
+    # Granting Free is how a plan is taken away: it is the floor, so there is
+    # nothing to verify and nothing left to run out.
+    subscription.verified = tier is not Tier.FREE
 
-    if tier is Tier.EXPIRED:
+    if tier is Tier.FREE:
         subscription.expires_at = now
 
     await session.flush()

@@ -13,12 +13,23 @@ UNIT_HARD_CAP = 10
 
 
 class Tier(StrEnum):
-    TRIAL = "trial"
+    #: The floor. Not sold, never expires, and what everything else falls back
+    #: to — a new account, a lapsed one, an unrecognised tier.
+    FREE = "free"
     STANDARD = "standard"
     PRO = "pro"
     FRIENDS = "friends"
-    #: Not sold. What a lapsed account resolves to — see EXPIRED_LIMITS.
-    EXPIRED = "expired"
+    #: Legacy. The fourteen-day trial is no longer granted to anyone; this
+    #: exists so the accounts still inside one finish the fortnight they were
+    #: promised, and so old subscription rows still resolve to something. It
+    #: can go once the last of them has run out.
+    TRIAL = "trial"
+
+
+#: Subscription rows written before the free plan existed. A lapsed account
+#: used to be stamped with this tier rather than computed, so the string is in
+#: the database and has to keep resolving.
+_LEGACY_TIERS = {"expired": Tier.FREE}
 
 
 @dataclass(frozen=True)
@@ -28,6 +39,14 @@ class Limits:
     max_single_file_size_mb: int
     max_single_file_pages: int
     daily_ai_queries: int
+    #: The most this tier will ever answer, across every day it is held.
+    #:
+    #: Only Free sets one. A daily limit alone bounds the rate and not the
+    #: bill: a free account that never converts costs five questions a day
+    #: for as long as it exists, and the point of the free plan is to show
+    #: someone the product, not to be the product. UNLIMITED everywhere else,
+    #: where a paid month is what bounds it.
+    lifetime_ai_queries: int
     quiz_count: int
     quiz_interval: str  # lifetime | weekly | unlimited
     quiz_max_questions: int
@@ -64,6 +83,7 @@ _PRO_LIMITS = Limits(
     max_single_file_size_mb=50,
     max_single_file_pages=300,
     daily_ai_queries=120,
+    lifetime_ai_queries=UNLIMITED,
     quiz_count=UNLIMITED,
     quiz_interval="unlimited",
     quiz_max_questions=20,
@@ -81,33 +101,55 @@ _PRO_LIMITS = Limits(
 #: these disagree, this file wins. Changing a number here means changing it
 #: there in the same commit.
 PLANS: dict[Tier, Plan] = {
-    # Not a product. Every metered allowance is zero, and every read stays
-    # open: a student who stops paying keeps their notes, their timetable and
-    # their ability to export or delete. Locking someone out of work they
+    # Enough to see whether the thing works, not enough to revise on.
+    #
+    # It replaced a fortnight's trial, and the reason is worth writing down:
+    # a trial is a thing worth stealing, so it needed an identity ledger, a
+    # keyed hash of every phone number, and a rule about what a returning
+    # student gets. A free tier that never ends has nothing to steal, and all
+    # of that machinery stopped being necessary along with it.
+    #
+    # This is also where a lapsed subscription lands. Every read stays open on
+    # any tier — a student who stops paying keeps their notes, their timetable
+    # and their ability to export or delete. Locking someone out of work they
     # wrote is not a business model, it is hostage-taking.
-    Tier.EXPIRED: Plan(
-        id=Tier.EXPIRED,
-        name="Expired",
+    Tier.FREE: Plan(
+        id=Tier.FREE,
+        name="Free",
         price_ksh=0,
+        # It does not run out. `get_entitlement` never expires this tier, and
+        # zero here says so rather than meaning "already over".
         duration_days=0,
         seats=1,
         limits=Limits(
-            # The units they already have stay visible; the cap only ever
-            # refuses a *new* one, so zero here means "add no more".
-            max_course_units=0,
-            total_pdf_pages_pool=0,
-            max_single_file_size_mb=0,
-            max_single_file_pages=0,
-            daily_ai_queries=0,
-            quiz_count=0,
+            # One unit is the point: enough to file a course and ask about it,
+            # not enough to carry a semester. The cap only ever refuses a
+            # *new* unit, so a student who paid, lapsed and has four keeps
+            # seeing all four.
+            max_course_units=1,
+            total_pdf_pages_pool=100,
+            max_single_file_size_mb=10,
+            # The whole pool in one document, so a single 100-page lecture PDF
+            # is uploadable rather than being refused for being one file.
+            max_single_file_pages=100,
+            daily_ai_queries=5,
+            # About three weeks of using it properly, or one very long night.
+            # Either way, enough to have found out whether it helps.
+            lifetime_ai_queries=100,
+            # One, ever. None at all would hide the feature that most obviously
+            # justifies paying for the thing.
+            quiz_count=1,
             quiz_interval="lifetime",
-            quiz_max_questions=0,
+            quiz_max_questions=5,
             timetable_mode="manual",
             source_citations="basic",
             allow_ocr_scans=False,
             monthly_ocr_page_limit=0,
         ),
     ),
+    # No longer granted. Left here so the accounts already inside a trial keep
+    # the limits they were promised until it runs out, at which point they
+    # land on Free like everyone else.
     Tier.TRIAL: Plan(
         id=Tier.TRIAL,
         name="14-Day Free Trial",
@@ -120,6 +162,8 @@ PLANS: dict[Tier, Plan] = {
             max_single_file_size_mb=10,
             max_single_file_pages=30,
             daily_ai_queries=15,
+            # The fortnight is the ceiling on a trial. It ends on its own.
+            lifetime_ai_queries=UNLIMITED,
             quiz_count=2,
             quiz_interval="lifetime",
             quiz_max_questions=5,
@@ -141,6 +185,7 @@ PLANS: dict[Tier, Plan] = {
             max_single_file_size_mb=25,
             max_single_file_pages=100,
             daily_ai_queries=40,
+            lifetime_ai_queries=UNLIMITED,
             quiz_count=5,
             quiz_interval="weekly",
             quiz_max_questions=10,
@@ -178,12 +223,17 @@ def plan_for(tier: str | Tier) -> Plan:
     try:
         return PLANS[Tier(tier)]
     except (ValueError, KeyError):
-        # An unrecognised tier resolves to *expired*, not to trial. A typo or a
-        # tampered row must never be worth more than nothing.
-        return PLANS[Tier.EXPIRED]
+        # A typo, a tampered row, or the "expired" tier this used to write
+        # before Free existed. All of them resolve to the floor: never to a
+        # paid plan, and never to the trial.
+        return PLANS[_LEGACY_TIERS.get(str(tier), Tier.FREE)]
 
 
 #: The tiers a student can actually buy, in the order they are shown.
+#:
+#: Free is not among them. There is nothing to buy and no trial to start — a
+#: new account simply has it, which is what removed the whole "has this number
+#: had a trial" question from the product.
 SELLABLE = (Tier.STANDARD, Tier.PRO, Tier.FRIENDS)
 
 

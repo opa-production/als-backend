@@ -234,6 +234,9 @@ class UsageOut(BaseModel):
     tier: str
     plan_name: str
     ai_queries_today: MeterOut
+    #: Only meaningful where the plan sets a lifetime ceiling — Free. Elsewhere
+    #: it reports as unlimited, and the app should not draw a bar for it.
+    ai_queries_total: MeterOut
     quizzes: MeterOut
     quiz_interval: str
     course_units: MeterOut
@@ -278,6 +281,10 @@ async def read_usage(user: CurrentUser, session: DbSession) -> UsageOut:
         ai_queries_today=meter(
             await current_usage(session, user.id, "ai_queries"),
             limits.daily_ai_queries,
+        ),
+        ai_queries_total=meter(
+            await current_usage(session, user.id, "ai_queries_lifetime"),
+            limits.lifetime_ai_queries,
         ),
         quizzes=meter(
             await current_usage(session, user.id, quiz_metric), limits.quiz_count

@@ -22,7 +22,6 @@ from app.models.knowledge import Material, MaterialChunk
 from app.services.ai import providers
 from app.services.ai import quiz as quiz_service
 from app.services.ai.providers import Usage
-from app.services.plans import Tier
 from tests.conftest import sign_in
 
 NOTES = (
@@ -313,24 +312,24 @@ async def test_a_quiz_needs_a_signed_in_student(client):
     assert response.status_code == 401
 
 
-async def test_a_lapsed_plan_cannot_build_quizzes(client, fake):
+async def test_free_gets_one_quiz_and_then_no_more(client, fake):
     """
-    `expired` allows zero, and the refusal is a 402 — "not included in what you
-    pay for", not "too fast".
+    One, ever. Enough to see what a quiz is; not a revision tool.
+
+    The refusal is a 402 — "not included in what you pay for", not "too fast".
+    A 429 would tell a student to wait for something that is never coming.
     """
     headers, user_id = await sign_in(client)
 
-    async with client.sessions() as session:
-        from app.services.billing import activate
-
-        await activate(session, user_id=user_id, tier=Tier.EXPIRED, verified=False)
-        await session.commit()
-
-    response = await client.post(
+    first = await client.post(
         "/api/v1/tutor/quiz", json={"topic": "deadlock"}, headers=headers
     )
+    assert first.status_code == 200
 
-    assert response.status_code == 402
+    second = await client.post(
+        "/api/v1/tutor/quiz", json={"topic": "deadlock"}, headers=headers
+    )
+    assert second.status_code == 402
 
 
 async def test_the_quiz_allowance_is_spent(client, fake):

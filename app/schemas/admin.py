@@ -367,6 +367,10 @@ class SubscriptionStatsOut(BaseModel):
     plans: list[PlanRowOut]
     total_active: int
     total_paying: int
+    #: Everyone on the free plan. The number a campaign is aimed at.
+    total_free: int
+    #: Legacy: accounts still inside a fourteen-day trial. No longer granted,
+    #: so this drains to zero and can go with the tier.
     total_trial: int
     total_expired: int
     #: Paid subscriptions the app wrote on a student's word that Kora has

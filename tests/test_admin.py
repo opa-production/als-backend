@@ -334,7 +334,8 @@ async def test_paying_excludes_trials(client):
     response = await client.get("/api/v1/admin/subscriptions/stats", headers=headers)
     body = response.json()
 
-    assert body["total_trial"] == 1
+    assert body["total_free"] == 1
+    assert body["total_trial"] == 0
     assert body["total_paying"] == 0
     assert body["mrr_ksh"] == 0
 
@@ -389,7 +390,7 @@ async def test_detail_shows_when_entitlement_disagrees_with_the_row(client):
 
     assert detail["subscription"]["tier"] == "pro"
     assert detail["subscription"]["is_active"] is False
-    assert detail["effective_tier"] == "expired"
+    assert detail["effective_tier"] == "free"
 
 
 async def test_granting_a_plan_writes_an_audit_entry(client):
@@ -413,7 +414,7 @@ async def test_granting_a_plan_writes_an_audit_entry(client):
     entry = entries["items"][0]
     assert entry["action"] == "subscription.granted"
     assert "compensation for the outage" in entry["summary"]
-    assert entry["meta"]["before"]["tier"] == "trial"
+    assert entry["meta"]["before"]["tier"] == "free"
 
 
 async def test_grant_extends_rather_than_restarts_the_same_tier(client):
@@ -561,7 +562,7 @@ async def test_ops_plans_is_the_server_side_catalogue(client):
     plans = {row["id"]: row for row in response.json()}
     assert plans["pro"]["price_ksh"] == 350
     assert plans["friends"]["price_per_seat_ksh"] == 250
-    assert plans["expired"]["limits"]["daily_ai_queries"] == 0
+    assert plans["free"]["limits"]["daily_ai_queries"] == 5
 
 
 # --- Audit -------------------------------------------------------------------

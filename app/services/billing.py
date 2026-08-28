@@ -355,7 +355,7 @@ async def join_group(
     current_end = as_utc(subscription.expires_at)
     own_plan_live = (
         subscription.group_id is None
-        and subscription.tier not in (Tier.TRIAL.value, Tier.EXPIRED.value)
+        and subscription.tier not in (Tier.TRIAL.value, Tier.FREE.value)
         and subscription.verified
         and current_end is not None
         and current_end > utc_now()
@@ -400,9 +400,10 @@ async def remove_member(
         select(Subscription).where(Subscription.user_id == member_user_id)
     )
     if subscription is not None and subscription.group_id == group.id:
-        # Expired, never back to trial. A seat handed round a hostel would
-        # otherwise mint a fresh fortnight for each person who left it.
-        subscription.tier = Tier.EXPIRED.value
+        # Back to the free floor, never to the trial. A seat handed round a
+        # hostel would otherwise mint a fresh fortnight for each person who
+        # left it.
+        subscription.tier = Tier.FREE.value
         subscription.group_id = None
         subscription.expires_at = utc_now()
 

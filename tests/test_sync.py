@@ -9,7 +9,8 @@ edit does not raise, it just quietly ruins someone's semester.
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from tests.conftest import OTHER_PHONE, sign_in
+from app.services.plans import Tier
+from tests.conftest import OTHER_PHONE, give_plan, sign_in
 
 
 def _unit(unit_id=None, *, code="CS201", title="Data Structures", updated=None, deleted=None):
@@ -130,7 +131,9 @@ async def test_a_deletion_travels_as_a_tombstone(client):
 
 
 async def test_the_cursor_only_returns_what_changed(client):
-    headers, _ = await sign_in(client)
+    headers, user_id = await sign_in(client)
+    # Two units, so the free plan's single-unit cap is not what this measures.
+    await give_plan(client, user_id, Tier.PRO)
     now = datetime.now(UTC)
 
     await client.post(
@@ -164,7 +167,7 @@ async def test_one_student_never_sees_another(client):
 
 async def test_the_unit_cap_rejects_the_row_not_the_request(client):
     """
-    A trial allows two units. The third is refused — and everything else in the
+    Free allows one unit. The rest are refused — and everything else in the
     same push still has to land.
     """
     headers, _ = await sign_in(client)
@@ -195,8 +198,8 @@ async def test_the_unit_cap_rejects_the_row_not_the_request(client):
     )
 
     body = response.json()
-    assert body["units"]["applied"] == 2
-    assert len(body["units"]["rejected"]) == 1
+    assert body["units"]["applied"] == 1
+    assert len(body["units"]["rejected"]) == 2
     # The event is not held hostage by the rejected unit.
     assert body["events"]["applied"] == 1
 

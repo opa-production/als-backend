@@ -154,8 +154,8 @@ async def test_profile_round_trip(client):
     me = await client.get("/api/v1/me", headers=headers)
     assert me.status_code == 200
     assert me.json()["phone"] == PHONE
-    # Every new account starts on a trial, created server-side.
-    assert me.json()["subscription"]["tier"] == "trial"
+    # Every new account starts on the free plan, written server-side.
+    assert me.json()["subscription"]["tier"] == "free"
 
     patched = await client.patch(
         "/api/v1/me", json={"full_name": "Deon", "program": "BSc CS"}, headers=headers

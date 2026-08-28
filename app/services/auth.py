@@ -24,8 +24,7 @@ from app.core.security import (
 from app.models.account import Device, User
 from app.models.auth import OtpCode, RefreshToken
 from app.models.billing import Subscription
-from app.services import trial as trial_service
-from app.services.plans import Tier, plan_for
+from app.services.plans import Tier
 
 log = structlog.get_logger()
 
@@ -253,34 +252,40 @@ async def create_user(
     device_id: uuid.UUID | None = None,
 ) -> User:
     """
-    A new account, with a trial only if this identity has never had one.
+    A new account, on the free plan.
 
-    One trial per person, for good — see ``app/services/trial.py``. A returning
-    account gets a subscription that is **already expired** rather than none at
-    all: the row keeps every downstream query simple, and the student lands on
-    the paywall instead of on a screen that cannot decide what they are.
+    No trial, and nothing to decide. A trial had to be granted, dated, and
+    defended against the same person returning with a new number — which took
+    an identity ledger and a keyed hash of every phone number in the product.
+    A free tier that never ends has nothing worth stealing, so all of that went
+    with it.
+
+    The subscription row is still written, and ``expires_at`` is null rather
+    than a date. Free does not run out, and a row saying so keeps every
+    downstream query the shape it already had: ``/me`` and
+    ``/billing/subscription`` still answer with a plan rather than with null,
+    which would have made "no plan" and "free plan" indistinguishable to the
+    app.
+
+    ``device_id`` is still taken, and now ignored. It was how a returning trial
+    was recognised. The signature is left alone because it will matter again
+    the moment anything has to be granted once per handset.
     """
     user = User(phone=phone, email=email, full_name=full_name)
     session.add(user)
     await session.flush()
 
-    decision = await trial_service.claim(
-        session, user_id=user.id, phone=phone, email=email, device_id=device_id
-    )
-
-    now = utc_now()
-    days = plan_for(Tier.TRIAL).duration_days
-
     session.add(
         Subscription(
             user_id=user.id,
-            tier=Tier.TRIAL.value,
-            started_at=now,
-            # Already over when the trial was refused. `get_entitlement` reads
-            # that as EXPIRED, so the restriction is immediate and needs no
-            # separate flag to remember it.
-            expires_at=now + timedelta(days=days) if decision.granted else now,
-            # A trial is not a payment, so there is nothing to reconcile.
+            tier=Tier.FREE.value,
+            started_at=utc_now(),
+            # Never. `get_entitlement` does not apply expiry to Free, so this
+            # is "no end" rather than "already over".
+            expires_at=None,
+            # Nothing was paid, so there is nothing for Kora to confirm. An
+            # unverified *paid* tier reads as free; an unverified free one
+            # would be a contradiction.
             verified=True,
         )
     )
@@ -290,7 +295,6 @@ async def create_user(
         "user_created",
         user_id=str(user.id),
         via="phone" if phone else "google",
-        trial_granted=decision.granted,
     )
     return user
 

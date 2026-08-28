@@ -499,19 +499,25 @@ async def funnel(session: AsyncSession) -> Funnel:
 
     signed_up = await _count(session, _count_of(User, User.deleted_at.is_(None)))
     started_trial = await _count(session, _count_of(Subscription))
+
+    # The field names still say "trial" because the console reads them, but
+    # what they count is the free floor: the trial is not granted any more, so
+    # a funnel keyed on it would report zero for ever.
+    #
+    # `trial_active` is everyone sitting on free right now -- the pool a sale
+    # can come out of. `trial_expired` is everyone who paid at some point and
+    # has since dropped back to it, which is the honest replacement for "had a
+    # trial and let it run out": both are people who have seen the product and
+    # are not paying today.
     trial_active = await _count(
         session,
-        _count_of(
-            Subscription,
-            Subscription.tier == Tier.TRIAL.value,
-            *active_subscription_filter(now),
-        ),
+        _count_of(Subscription, Subscription.tier == Tier.FREE.value),
     )
     trial_expired = await _count(
         session,
         _count_of(
             Subscription,
-            Subscription.tier == Tier.TRIAL.value,
+            Subscription.tier.in_(paid_tiers()),
             Subscription.expires_at <= now,
         ),
     )

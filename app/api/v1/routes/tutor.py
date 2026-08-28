@@ -39,6 +39,7 @@ from app.services.quota import (
     check_ai_query,
     check_quiz,
     get_entitlement,
+    record_ai_query,
     record_usage,
 )
 
@@ -317,7 +318,7 @@ async def ask(
         role="student",
         content=payload.question,
     )
-    await record_usage(session, user.id, "ai_queries")
+    await record_ai_query(session, user.id)
     await session.commit()
 
     sources = [

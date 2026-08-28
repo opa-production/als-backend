@@ -16,141 +16,130 @@ from app.core.clock import now as utc_now
 from app.core.errors import AppError
 from app.models.account import User
 from app.models.billing import Subscription
-from app.models.trial import TrialGrant
 from app.services.billing import activate, assert_charge_belongs_to
 from app.services.plans import Tier, plan_for
-from app.services.quota import check_ai_query, get_entitlement
-from tests.conftest import OTHER_PHONE, PHONE, sign_in
+from app.services.quota import check_ai_query, get_entitlement, record_usage
+from tests.conftest import OTHER_PHONE, PHONE, give_plan, sign_in
 from tests.test_billing import _charge
 
-# --- One trial per person, for good -------------------------------------------
+# --- The free floor -----------------------------------------------------------
+#
+# There used to be a fortnight's trial here, and most of this file was about
+# defending it: one grant per identity, a keyed hash of every phone number, and
+# a rule for what a student got when they deleted the account and came back.
+#
+# A free tier that never ends has nothing worth stealing, so none of that is
+# needed. What replaces it is smaller and more important -- that free is small
+# enough to be a demonstration rather than a product, and that nothing resolves
+# *upward* from it by accident.
 
 
-async def test_a_new_account_gets_fourteen_days(client):
+async def test_a_new_account_is_on_the_free_plan(client):
     headers, _ = await sign_in(client)
 
     body = (await client.get("/api/v1/billing/subscription", headers=headers)).json()
-    assert body["tier"] == "trial"
-    assert body["days_remaining"] >= 13
+
+    assert body["tier"] == "free"
+    # Free does not run out. A countdown here would be a paywall with no date.
+    assert body["expires_at"] is None
 
 
-async def test_deleting_and_signing_back_in_does_not_reset_the_trial(client):
+async def test_deleting_and_signing_back_in_gains_nothing(client):
     """
-    The attack: burn the fortnight, delete the account, sign up on the same
-    number, repeat forever.
+    The attack the trial ledger existed to stop: burn the allowance, delete the
+    account, sign up again on the same number, repeat.
 
-    Inside the deletion window the account comes back as it was — same trial,
-    same end date, not a new one. That is the protection: the clock does not
-    restart.
+    It now gains nothing, because there is nothing better to come back to. This
+    is the test that says the removal was safe.
     """
     headers, _ = await sign_in(client)
-    before = (
-        await client.get("/api/v1/billing/subscription", headers=headers)
-    ).json()
-
     assert (await client.delete("/api/v1/me", headers=headers)).status_code == 200
 
     again, _ = await sign_in(client)
-    after = (await client.get("/api/v1/billing/subscription", headers=again)).json()
-
-    # The same fortnight, not a fresh one.
-    assert after["expires_at"] == before["expires_at"]
-
-    async with client.sessions() as session:
-        grants = (await session.scalars(select(TrialGrant))).all()
-    assert len(grants) == 1
-
-
-async def test_an_exhausted_trial_stays_exhausted_after_a_delete(client):
-    """
-    The same attack, run to completion: wait out the fortnight *then* delete
-    and come back. This is the one that has to hold.
-    """
-    headers, user_id = await sign_in(client)
-
-    async with client.sessions() as session:
-        subscription = await session.scalar(
-            select(Subscription).where(Subscription.user_id == user_id)
-        )
-        subscription.expires_at = utc_now() - timedelta(days=1)
-        await session.commit()
-
-    await client.delete("/api/v1/me", headers=headers)
-
-    again, _ = await sign_in(client)
     body = (await client.get("/api/v1/billing/subscription", headers=again)).json()
 
-    assert body["tier"] == "expired"
-    assert body["is_expired"] is True
+    assert body["tier"] == "free"
 
 
-async def test_a_hard_deleted_account_still_cannot_get_a_second_trial(client):
+async def test_free_is_a_demonstration_not_a_product(client):
     """
-    Once the retention sweep has removed the row, signing up is a genuinely
-    new account — and the grant, which outlives the user, is what refuses it.
+    One unit and five questions a day. Enough to see whether the tutor answers
+    from your own notes; not enough to revise a semester on.
     """
-    headers, user_id = await sign_in(client)
-    await client.delete("/api/v1/me", headers=headers)
+    _, user_id = await sign_in(client)
 
-    # What the retention sweep will eventually do.
     async with client.sessions() as session:
-        user = await session.get(User, user_id)
-        await session.delete(user)
+        entitlement = await get_entitlement(session, user_id)
+
+    assert entitlement.tier is Tier.FREE
+    assert entitlement.limits.max_course_units == 1
+    assert entitlement.limits.daily_ai_queries == 5
+    assert entitlement.limits.total_pdf_pages_pool == 100
+
+
+async def test_the_free_daily_allowance_actually_refuses(client):
+    """A limit that is advertised and not enforced is not a limit."""
+    _, user_id = await sign_in(client)
+
+    async with client.sessions() as session:
+        entitlement = await get_entitlement(session, user_id)
+
+        for _ in range(entitlement.limits.daily_ai_queries):
+            await check_ai_query(session, user_id, entitlement)
+            await record_usage(session, user_id, "ai_queries")
+
+        with pytest.raises(AppError):
+            await check_ai_query(session, user_id, entitlement)
+
+
+async def test_the_free_plan_runs_out_for_good(client):
+    """
+    The ceiling that makes free affordable to run.
+
+    Five a day bounds the rate and not the bill: an account that never converts
+    would otherwise cost five questions a day for as long as it exists. A
+    hundred is where the free plan ends, and the refusal has to say that rather
+    than telling someone to come back tomorrow for a reset that is never coming.
+    """
+    _, user_id = await sign_in(client)
+
+    async with client.sessions() as session:
+        entitlement = await get_entitlement(session, user_id)
+        ceiling = entitlement.limits.lifetime_ai_queries
+        assert ceiling == 100
+
+        await record_usage(session, user_id, "ai_queries_lifetime", ceiling)
         await session.commit()
 
-    again, new_user_id = await sign_in(client)
-    assert new_user_id != user_id
+    async with client.sessions() as session:
+        entitlement = await get_entitlement(session, user_id)
+        with pytest.raises(AppError) as refused:
+            await check_ai_query(session, user_id, entitlement)
 
-    body = (await client.get("/api/v1/billing/subscription", headers=again)).json()
-    assert body["tier"] == "expired"
+    assert "free plan" in str(refused.value.message)
 
 
-async def test_the_trial_record_survives_the_account(client):
-    """
-    A grant hanging off the user row would vanish with the user row — which is
-    precisely the moment it has to still be true.
-    """
-    headers, user_id = await sign_in(client)
-    await client.delete("/api/v1/me", headers=headers)
+async def test_a_paid_plan_has_no_lifetime_ceiling(client):
+    """The month is what bounds a paid plan. Anything else would be a trap."""
+    _, user_id = await sign_in(client)
+    await give_plan(client, user_id, Tier.PRO)
 
     async with client.sessions() as session:
-        grants = (await session.scalars(select(TrialGrant))).all()
-
-    assert len(grants) >= 1
-    assert grants[0].granted_to_user_id == user_id
-
-
-async def test_the_stored_identity_is_not_the_phone_number(client):
-    """A table that is never deleted must not be a list of everyone's number."""
-    await sign_in(client)
+        entitlement = await get_entitlement(session, user_id)
+        await record_usage(session, user_id, "ai_queries_lifetime", 5000)
+        await session.commit()
 
     async with client.sessions() as session:
-        grant = await session.scalar(select(TrialGrant))
-
-    assert PHONE not in grant.identity_hash
-    assert grant.identity_hash != PHONE
-    assert len(grant.identity_hash) == 64
+        entitlement = await get_entitlement(session, user_id)
+        # No exception: the counter is kept on every tier, and ignored here.
+        await check_ai_query(session, user_id, entitlement)
 
 
-async def test_a_second_number_still_gets_its_own_trial(client):
+async def test_a_lapsed_plan_falls_to_free_rather_than_to_nothing(client):
     """
-    The defence must not catch innocents: a genuinely different student is a
-    different identity and gets their fourteen days.
-    """
-    await sign_in(client)
-    other, _ = await sign_in(client, phone=OTHER_PHONE)
-
-    body = (await client.get("/api/v1/billing/subscription", headers=other)).json()
-    assert body["tier"] == "trial"
-
-
-# --- Expiry bites immediately -------------------------------------------------
-
-
-async def test_an_expired_trial_blocks_metered_features(client):
-    """
-    "Restrictions enforced immediately" means on the very next request, not
-    after a nightly job has caught up.
+    Expiry is evaluated per request, so the drop is immediate -- but it is a
+    drop to the same floor everyone else stands on, not to a tier with nothing
+    in it. Someone who paid once and stopped is still a user.
     """
     _, user_id = await sign_in(client)
 
@@ -158,18 +147,66 @@ async def test_an_expired_trial_blocks_metered_features(client):
         subscription = await session.scalar(
             select(Subscription).where(Subscription.user_id == user_id)
         )
+        subscription.tier = Tier.PRO.value
+        subscription.verified = True
         subscription.expires_at = utc_now() - timedelta(seconds=1)
         await session.commit()
 
     async with client.sessions() as session:
         entitlement = await get_entitlement(session, user_id)
-        assert entitlement.tier is Tier.EXPIRED
 
-        with pytest.raises(AppError):
-            await check_ai_query(session, user_id, entitlement)
+    assert entitlement.tier is Tier.FREE
+    # What they had is still reportable, so the app can say which plan ended.
+    assert entitlement.nominal_tier is Tier.PRO
+    assert entitlement.limits.daily_ai_queries == 5
 
 
-async def test_an_expired_account_can_still_read_its_own_work(client):
+async def test_a_trial_still_running_is_left_alone(client):
+    """
+    The trial is no longer granted, but the accounts inside one were promised a
+    fortnight. It keeps its own limits until it runs out, then falls to free
+    like everything else.
+    """
+    _, user_id = await sign_in(client)
+
+    async with client.sessions() as session:
+        subscription = await session.scalar(
+            select(Subscription).where(Subscription.user_id == user_id)
+        )
+        subscription.tier = Tier.TRIAL.value
+        subscription.expires_at = utc_now() + timedelta(days=3)
+        await session.commit()
+
+    async with client.sessions() as session:
+        entitlement = await get_entitlement(session, user_id)
+
+    trial_questions = plan_for(Tier.TRIAL).limits.daily_ai_queries
+    assert entitlement.tier is Tier.TRIAL
+    assert entitlement.limits.daily_ai_queries == trial_questions
+
+
+async def test_the_old_expired_tier_still_resolves(client):
+    """
+    Rows written before free existed have "expired" in the tier column. That
+    string has to keep meaning something, and the something is free.
+    """
+    _, user_id = await sign_in(client)
+
+    async with client.sessions() as session:
+        subscription = await session.scalar(
+            select(Subscription).where(Subscription.user_id == user_id)
+        )
+        subscription.tier = "expired"
+        subscription.expires_at = utc_now() - timedelta(days=1)
+        await session.commit()
+
+    async with client.sessions() as session:
+        entitlement = await get_entitlement(session, user_id)
+
+    assert entitlement.tier is Tier.FREE
+
+
+async def test_a_free_account_can_still_read_its_own_work(client):
     """
     Locking someone out of notes they wrote is hostage-taking, not billing.
     Reads and sync stay open at every tier.
@@ -191,7 +228,7 @@ async def test_an_expired_account_can_still_read_its_own_work(client):
 async def test_an_unverified_paid_plan_grants_nothing(client):
     """
     The app writes a subscription optimistically when a student says they
-    paid. Until Kora confirms it, that is a claim — and a claim that
+    paid. Until Kora confirms it, that is a claim -- and a claim that
     unlocked the product would make the payment optional.
     """
     _, user_id = await sign_in(client)
@@ -208,7 +245,7 @@ async def test_an_unverified_paid_plan_grants_nothing(client):
     async with client.sessions() as session:
         entitlement = await get_entitlement(session, user_id)
 
-    assert entitlement.tier is Tier.EXPIRED
+    assert entitlement.tier is Tier.FREE
     assert entitlement.nominal_tier is Tier.PRO
 
 
@@ -227,7 +264,7 @@ async def test_a_tampered_tier_is_worth_nothing(client):
     async with client.sessions() as session:
         entitlement = await get_entitlement(session, user_id)
 
-    assert entitlement.tier is Tier.EXPIRED
+    assert entitlement.tier is Tier.FREE
 
 
 # --- Payments belong to the person who made them ------------------------------

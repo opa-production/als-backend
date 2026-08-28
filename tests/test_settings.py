@@ -242,15 +242,15 @@ async def test_no_study_days_is_a_zero_streak_not_an_error(client):
 # --- Usage --------------------------------------------------------------------
 
 
-async def test_usage_reports_the_trial_meters(client):
+async def test_usage_reports_the_free_meters(client):
     headers, _ = await sign_in(client)
 
     body = (await client.get("/api/v1/me/usage", headers=headers)).json()
 
-    assert body["tier"] == "trial"
-    assert body["ai_queries_today"] == {"used": 0, "limit": 15, "unlimited": False}
-    assert body["course_units"]["limit"] == 2
-    # No OCR on the trial, so the meter is a zero ceiling rather than a lie.
+    assert body["tier"] == "free"
+    assert body["ai_queries_today"] == {"used": 0, "limit": 5, "unlimited": False}
+    assert body["course_units"]["limit"] == 1
+    # No OCR on free, so the meter is a zero ceiling rather than a lie.
     assert body["ocr_pages_this_month"]["limit"] == 0
 
 

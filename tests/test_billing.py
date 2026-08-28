@@ -165,8 +165,8 @@ def test_metadata_alone_cannot_buy_a_plan():
 
 
 def test_metadata_cannot_name_a_tier_that_is_not_for_sale():
-    # "expired" is a real Tier and worth nothing. It must never resolve.
-    assert tier_from_charge(_charge(350, tier="expired")) is Tier.PRO
+    # "free" is a real Tier and worth nothing paid. It must never resolve.
+    assert tier_from_charge(_charge(350, tier="free")) is Tier.PRO
 
 
 def test_the_amount_resolves_the_tier_without_metadata():
@@ -229,20 +229,21 @@ async def test_switching_tier_starts_a_fresh_period(client):
     assert (switched.expires_at - utc_now()).days == pytest.approx(days, abs=1)
 
 
-async def test_subscription_endpoint_reports_the_trial(client):
+async def test_subscription_endpoint_reports_the_free_plan(client):
     headers, _ = await sign_in(client)
 
     body = (await client.get("/api/v1/billing/subscription", headers=headers)).json()
-    assert body["tier"] == "trial"
-    assert body["days_remaining"] <= 14
-    assert body["days_remaining"] >= 13
-    assert body["is_expired"] is False
+    assert body["tier"] == "free"
+    # Free does not run out, so there is no countdown to report.
+    assert body["expires_at"] is None
+    # True, and it is what the paywall asks: there is no paid plan in force.
+    assert body["is_expired"] is True
 
 
 async def test_a_lapsed_plan_reports_as_expired(client):
     """
-    Not "trial". Falling back to trial limits would be a free tier nobody
-    agreed to sell: pay for one month, lapse, keep the trial forever.
+    Down to the free floor, not back to the trial — and not to a tier with
+    nothing in it either. Someone who paid once and stopped is still a user.
     """
     _, user_id = await sign_in(client)
 
@@ -260,7 +261,7 @@ async def test_a_lapsed_plan_reports_as_expired(client):
 
     headers, _ = await sign_in(client)
     body = (await client.get("/api/v1/billing/subscription", headers=headers)).json()
-    assert body["tier"] == "expired"
+    assert body["tier"] == "free"
     assert body["is_expired"] is True
     # What they had is still reported, so the app can name what ended.
     assert body["nominal_tier"] == "pro"
@@ -271,9 +272,9 @@ async def test_only_sellable_plans_are_advertised(client):
 
     ids = {plan["id"] for plan in body}
     assert ids == {"standard", "pro", "friends"}
-    # Neither the trial nor the expired tier is a product.
+    # Neither the free plan nor the legacy trial is a product.
     assert "trial" not in ids
-    assert "expired" not in ids
+    assert "free" not in ids
 
     friends = next(p for p in body if p["id"] == "friends")
     assert friends["seats"] == 5
@@ -417,7 +418,7 @@ async def test_checkout_prices_the_plan_from_the_server(client, kora):
 async def test_a_tier_that_is_not_for_sale_cannot_be_bought(client, kora):
     headers, _ = await sign_in(client)
 
-    for tier in ("trial", "expired", "nonsense"):
+    for tier in ("trial", "free", "nonsense"):
         response = await client.post(
             "/api/v1/billing/checkout", json={"tier": tier}, headers=headers
         )
@@ -562,7 +563,7 @@ async def test_removing_a_member_frees_the_seat_and_the_entitlement(client):
     subscription = (
         await client.get("/api/v1/billing/subscription", headers=friend_headers)
     ).json()
-    assert subscription["tier"] == "expired"
+    assert subscription["tier"] == "free"
 
 
 async def test_someone_elses_group_is_not_yours_to_manage(client):

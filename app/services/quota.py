@@ -24,7 +24,7 @@ class Entitlement:
     verified: bool
     #: The tier that was bought, before expiry was applied. Only for showing
     #: "your Synapse plan ended" — never for deciding what is allowed.
-    nominal_tier: Tier = Tier.TRIAL
+    nominal_tier: Tier = Tier.FREE
 
     @property
     def limits(self):
@@ -32,7 +32,16 @@ class Entitlement:
 
     @property
     def is_expired(self) -> bool:
-        return self.tier is Tier.EXPIRED
+        """
+        Whether they are on the free floor rather than something they bought.
+
+        Still called `is_expired` because that is what the app and the billing
+        response call it, and it still answers the question the paywall asks:
+        is there a paid plan in force. What changed underneath is where the
+        answer lands — Free, with a small allowance, rather than a tier with
+        nothing in it at all.
+        """
+        return self.tier is Tier.FREE
 
 
 # --- Periods -----------------------------------------------------------------
@@ -59,6 +68,7 @@ def month_key(moment: datetime | None = None) -> str:
 #: Which period each metered thing rolls over on.
 METRIC_PERIODS = {
     "ai_queries": day_key,
+    "ai_queries_lifetime": lambda _=None: "lifetime",
     "quizzes_weekly": week_key,
     "quizzes_lifetime": lambda _=None: "lifetime",
     "ocr_pages": month_key,
@@ -78,37 +88,39 @@ async def get_entitlement(session: AsyncSession, user_id: uuid.UUID) -> Entitlem
     column, and windows like that are what people find and share. Comparing a
     timestamp costs nothing and cannot be out of date.
 
-    A lapsed subscription resolves to ``EXPIRED``, not back to the trial. The
-    earlier behaviour was a loophole: pay for one month, lapse, and keep trial
-    limits forever — a free tier nobody agreed to sell. Reads stay open, so
-    nothing a student wrote is held hostage.
+    A lapsed subscription resolves to ``FREE`` — the same floor a new account
+    stands on, not a tier with nothing in it. Reads stay open on every tier, so
+    nothing a student wrote is held hostage either way.
 
-    An unverified paid subscription is treated as expired too. The app writes
-    one optimistically when a student says they paid; until Kora confirms
-    it, that is a claim, and a claim is not an entitlement.
+    An unverified paid subscription resolves there too. The app writes one
+    optimistically when a student says they paid; until Kora confirms it, that
+    is a claim, and a claim is not an entitlement.
     """
     subscription = await session.scalar(
         select(Subscription).where(Subscription.user_id == user_id)
     )
 
     if subscription is None:
-        # No row at all means the account never got a trial — which is what a
-        # returning abuser looks like. Nothing, not a fresh fortnight.
+        # The normal state of a new account. Nothing is written at sign-up any
+        # more: Free is what the absence of a subscription *means*, so there is
+        # no row to create, expire, or get wrong.
         return Entitlement(
-            tier=Tier.EXPIRED,
+            tier=Tier.FREE,
             expires_at=None,
             verified=False,
-            nominal_tier=Tier.EXPIRED,
+            nominal_tier=Tier.FREE,
         )
 
     nominal = plan_for(subscription.tier).id
     expires = as_utc(subscription.expires_at)
 
-    lapsed = expires is None or expires <= utc_now()
-    unverified_paid = nominal is not Tier.TRIAL and not subscription.verified
+    # Free does not run out, so it is never lapsed. Anything else with no end
+    # date is a row that was never finished, and that is not an entitlement.
+    lapsed = nominal is not Tier.FREE and (expires is None or expires <= utc_now())
+    unverified_paid = nominal not in (Tier.FREE, Tier.TRIAL) and not subscription.verified
 
     return Entitlement(
-        tier=Tier.EXPIRED if (lapsed or unverified_paid) else nominal,
+        tier=Tier.FREE if (lapsed or unverified_paid) else nominal,
         expires_at=expires,
         verified=subscription.verified,
         nominal_tier=nominal,
@@ -223,13 +235,46 @@ async def check_unit_cap(
 async def check_ai_query(
     session: AsyncSession, user_id: uuid.UUID, entitlement: Entitlement
 ) -> None:
-    limit = entitlement.limits.daily_ai_queries
+    """
+    Two ceilings, and they mean different things to the person who hits them.
+
+    The daily one is a rate: come back tomorrow. The lifetime one is the end of
+    the free plan, and the message has to say so — telling someone to wait for
+    a reset that is never coming is worse than telling them the truth.
+    """
+    limits = entitlement.limits
+
+    if limits.lifetime_ai_queries != UNLIMITED:
+        spent = await current_usage(session, user_id, "ai_queries_lifetime")
+        if spent >= limits.lifetime_ai_queries:
+            raise QuotaExceeded(
+                f"You have used all {limits.lifetime_ai_queries} questions the "
+                "free plan includes. A paid plan carries on from here."
+            )
+
+    limit = limits.daily_ai_queries
     if limit == UNLIMITED:
         return
 
     used = await current_usage(session, user_id, "ai_queries")
     if used >= limit:
         raise QuotaExceeded(f"You have used today's {limit} AI questions.")
+
+
+async def record_ai_query(session: AsyncSession, user_id: uuid.UUID) -> None:
+    """
+    Spends one question against both meters.
+
+    One call rather than two at the call site: the lifetime counter is easy to
+    forget, and forgetting it is silent — the daily limit still works, so
+    nothing looks broken while the ceiling quietly does not exist.
+
+    The lifetime counter is kept for every tier, not only Free. It costs one
+    row per account and means a student who pays, lapses, and lands back on
+    Free is measured from where they actually got to.
+    """
+    await record_usage(session, user_id, "ai_queries")
+    await record_usage(session, user_id, "ai_queries_lifetime")
 
 
 async def check_quiz(

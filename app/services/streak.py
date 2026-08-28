@@ -78,10 +78,20 @@ async def compute(
     streak = Streak(last_day=days[0], total_days=len(days))
 
     # --- Current run --------------------------------------------------------
-    anchor = today if days[0] == today else today - timedelta(days=1)
-
-    if days[0] == anchor:
-        expected = anchor
+    #
+    # Counted back from the newest day rather than from an anchor pinned to
+    # `today`. The anchor version asked whether `days[0]` was exactly today or
+    # exactly yesterday and abandoned the whole count otherwise, which meant a
+    # day *ahead* of `today` scored zero rather than one: `GET /me/streak`
+    # dates itself in UTC while `POST /me/streak` stores the student's local
+    # day, so for anyone east of UTC every day between midnight and their
+    # offset has a newest day the read side thinks is in the future. A live
+    # streak read as 0 for those hours, then healed itself later in the day.
+    #
+    # A run is alive if it reaches yesterday. Today being absent does not end
+    # it: the day is not over.
+    if days[0] >= today - timedelta(days=1):
+        expected = days[0]
         for day in days:
             if day == expected:
                 streak.current += 1

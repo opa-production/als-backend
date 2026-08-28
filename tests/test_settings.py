@@ -158,6 +158,35 @@ async def test_a_gap_ends_the_streak(client):
     assert streak.current == 2
 
 
+async def test_a_day_ahead_of_the_server_still_counts(client):
+    """
+    The read side dates itself in UTC; the write side stores the student's own
+    local day. East of UTC those disagree between midnight and the offset, so
+    the newest stored day can be *ahead* of the server's `today`.
+
+    That must not read as a broken streak. It used to score zero, not one: the
+    run was anchored to `today` and simply refused to count when the newest day
+    did not sit exactly on it or the day before.
+    """
+    _, user_id = await sign_in(client)
+
+    # 00:30 in Nairobi on the 11th is still the 10th in UTC.
+    local_today = date(2026, 3, 11)
+    server_today = date(2026, 3, 10)
+
+    async with client.sessions() as session:
+        for offset in range(3):
+            await record_day(
+                session, user_id=user_id, day=local_today - timedelta(days=offset)
+            )
+        await session.commit()
+
+    async with client.sessions() as session:
+        streak = await compute(session, user_id=user_id, today=server_today)
+
+    assert streak.current == 3
+
+
 async def test_not_having_revised_yet_today_keeps_yesterdays_run(client):
     """
     Opening the app at nine in the morning must not read as a broken streak.

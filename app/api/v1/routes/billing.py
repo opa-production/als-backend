@@ -125,16 +125,20 @@ async def read_subscription(user: CurrentUser, session: DbSession) -> Subscripti
     """
     The entitlement in force right now.
 
-    An expired plan reports as `trial` rather than as the tier that was bought,
-    because that is what the limits actually are. `verified` is false when a
-    payment has not been confirmed by Kora — the app writes that optimistically
-    and this is where it gets reconciled.
+    A lapsed plan reports as `free` rather than as the tier that was bought,
+    because that is what the limits actually are; `nominal_tier` still names
+    what ended. `verified` is false when a payment has not been confirmed by
+    Kora — the app writes that optimistically and this is where it gets
+    reconciled.
     """
     entitlement = await get_entitlement(session, user.id)
     plan = plan_for(entitlement.tier)
 
+    # No countdown on free: it does not run out. A lapsed plan still carries
+    # the date it ended, and reporting "0 days left" beside the word Free reads
+    # as a plan about to be taken away rather than one that is simply on.
     remaining = None
-    if entitlement.expires_at is not None:
+    if entitlement.tier is not Tier.FREE and entitlement.expires_at is not None:
         from app.core.clock import now as utc_now
 
         remaining = max(0, (entitlement.expires_at - utc_now()).days)

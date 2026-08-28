@@ -50,9 +50,37 @@ class ProfileUpdate(BaseModel):
     program: str | None = Field(default=None, max_length=160)
     year_of_study: int | None = Field(default=None, ge=1, le=8)
     semester: int | None = Field(default=None, ge=1, le=3)
-    avatar_path: str | None = Field(default=None, max_length=512)
+
+    # `avatar_path` is deliberately not here. It named an object in a private
+    # bucket, so a client that could set it freely could point it at somebody
+    # else's file and then read that file back through /me/avatar-url. It is
+    # set only by POST /me/avatar, which checks the path against the caller.
 
 
 class DeleteAccountResponse(BaseModel):
     deleted: bool = True
     message: str
+
+
+class AvatarUploadUrlRequest(BaseModel):
+    """What the device is about to send, so it can be refused before it does."""
+
+    mime_type: str = Field(max_length=128)
+    byte_size: int = Field(gt=0)
+
+
+class AvatarUploadUrlResponse(BaseModel):
+    upload_url: str
+    bucket: str
+    #: Hand this back to POST /me/avatar once the upload has landed.
+    path: str
+    token: str
+
+
+class ConfirmAvatarRequest(BaseModel):
+    path: str = Field(max_length=512)
+
+
+class AvatarUrlResponse(BaseModel):
+    url: str
+    expires_in: int

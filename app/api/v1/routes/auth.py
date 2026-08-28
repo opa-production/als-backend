@@ -36,15 +36,21 @@ async def send_otp(
     With no SMS provider configured the code comes back in `debug_code` and is
     written to the server log, so the whole flow works in Swagger with no
     account and no credit. That field disappears the moment credentials exist.
+
+    The store review number is the one exception: nothing is minted and nothing
+    is sent, because its code is fixed and already in the review notes. The
+    response is identical, so the endpoint still says nothing about which
+    numbers are special.
     """
     code = await auth_service.request_otp(session, phone=payload.phone)
 
-    provider = get_sms_provider(http)
-    await provider.send(
-        auth_service.normalise_phone(payload.phone),
-        f"{code} is your ALS code. It expires in "
-        f"{settings.otp_ttl_seconds // 60} minutes.",
-    )
+    if code is not None:
+        provider = get_sms_provider(http)
+        await provider.send(
+            auth_service.normalise_phone(payload.phone),
+            f"{code} is your ALS code. It expires in "
+            f"{settings.otp_ttl_seconds // 60} minutes.",
+        )
 
     return OtpRequestResponse(
         expires_in_seconds=settings.otp_ttl_seconds,
@@ -59,6 +65,9 @@ async def verify_otp(payload: OtpVerifyRequest, session: DbSession) -> TokenPair
 
     There is no separate sign-up: a number that verifies and has no account
     gets one.
+
+    The store review number signs in with its fixed code and is put back on a
+    full, unexpired plan every time, so a reviewer never lands on the paywall.
 
     A **new** account gets the fourteen-day trial only if this number has never
     had one. Deleting an account and signing up again returns you to where you

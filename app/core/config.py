@@ -115,6 +115,28 @@ class Settings(BaseSettings):
     def sms_configured(self) -> bool:
         return bool(self.sms_api_key and self.sms_partner_id)
 
+    # --- The store review account -----------------------------------------
+    #
+    # Google Play and the App Store both want a working login in the review
+    # notes, and this product has no password to give them: sign-in is Google
+    # or a code texted to a phone the reviewer does not hold.
+    #
+    # So one number is declared here as a review account. Asking for a code on
+    # it sends no SMS and writes no code — the code is the fixed one below, and
+    # it is the only one that number ever accepts. Everything after that is an
+    # ordinary account: real tokens, real data, the same endpoints.
+    #
+    # Blank means the account does not exist at all, which is the right default
+    # everywhere except the environment that actually faces a reviewer. The
+    # number must be one nobody can be issued in real life, or a student could
+    # be handed a phone number that signs in without a code.
+    review_phone: str = ""
+    review_otp_code: str = ""
+
+    @property
+    def review_account_configured(self) -> bool:
+        return bool(self.review_phone and self.review_otp_code)
+
     # --- Google sign-in ---------------------------------------------------
     #: The OAuth client ids the mobile app uses. An ID token is only accepted
     #: if its audience is one of these — without the check, a token minted for

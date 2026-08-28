@@ -256,6 +256,42 @@ test signup before the Celcom account is live:
 journalctl -u als-backend -f
 ```
 
+**The app store review account.** Google Play and the App Store both ask for a
+working login in the review notes, and this product has none to give: sign-in is
+Google, or a code texted to a phone the reviewer does not hold. Two variables in
+`/etc/als-backend/env` declare one number that takes a fixed code instead:
+
+```bash
+REVIEW_PHONE=+254999000001
+REVIEW_OTP_CODE=428913
+```
+
+Asking for a code on that number sends no SMS and writes nothing to the
+database — the code above is the only one it ever accepts — and signing in with
+it puts the account on a Synapse plan renewed on every sign-in, so a reviewer
+coming back months later still does not meet the paywall. Everything else about
+it is an ordinary account.
+
+What goes in the Play Console under *App content → App access → All
+functionality is available with the credentials below*:
+
+| | |
+|---|---|
+| Username | `+254999000001` |
+| Password | `428913` |
+| Instructions | Choose **Continue with phone**, enter the number above, tap send, then enter the code above. No SMS is sent to this test number; the code is fixed. |
+
+Two rules if it is ever changed. The number must be one no real person can be
+issued — `0999` is not a range any Kenyan operator assigns, which is why this
+one is safe — or whoever holds it signs in without a code. And both variables
+must be set: blank either one and the account does not exist, which shows up as
+a reviewer who cannot get in. The service logs `review_account_enabled` with
+the number at startup while it is live, so it is never a surprise:
+
+```bash
+journalctl -u als-backend | grep review_account
+```
+
 **`/docs` is off in production.** `ENVIRONMENT=production` disables Swagger and
 `/openapi.json` deliberately. To browse the API against the live server, set
 `ENVIRONMENT=staging` temporarily — but note that also disables the startup

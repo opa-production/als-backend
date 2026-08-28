@@ -13,6 +13,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.deps import get_http_client
+from app.core.config import settings
 from app.db.base import Base
 from app.db.session import get_session
 from app.main import app
@@ -208,3 +209,95 @@ async def test_deleting_the_account_locks_it_out(client):
 
     # The tombstone takes effect on the very next request, not at token expiry.
     assert (await client.get("/api/v1/me", headers=headers)).status_code == 401
+
+
+# --- The store review account ------------------------------------------------
+
+
+REVIEW_PHONE = "+254799000001"
+REVIEW_CODE = "314159"
+
+
+@pytest.fixture
+def review_account(monkeypatch):
+    """
+    Turns the review number on for one test.
+
+    Patched on the settings object rather than the environment because settings
+    is read once at import and cached — an environment variable set here would
+    be read by nothing.
+    """
+    monkeypatch.setattr(settings, "review_phone", REVIEW_PHONE)
+    monkeypatch.setattr(settings, "review_otp_code", REVIEW_CODE)
+
+
+async def test_the_review_number_sends_nothing(client, review_account):
+    sent = await client.post("/api/v1/auth/otp", json={"phone": REVIEW_PHONE})
+
+    # Same status and shape as any other number: the endpoint must not be a way
+    # to find out which number is the special one.
+    assert sent.status_code == 202
+    assert sent.json()["debug_code"] is None
+
+
+async def test_the_review_number_signs_in_with_its_fixed_code(client, review_account):
+    await client.post("/api/v1/auth/otp", json={"phone": REVIEW_PHONE})
+
+    response = await client.post(
+        "/api/v1/auth/otp/verify",
+        json={"phone": REVIEW_PHONE, "code": REVIEW_CODE, "platform": "android"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["is_new_user"] is True
+
+
+async def test_the_review_code_works_without_asking_for_one(client, review_account):
+    """A reviewer who already has the code should not need the send step."""
+    response = await client.post(
+        "/api/v1/auth/otp/verify", json={"phone": REVIEW_PHONE, "code": REVIEW_CODE}
+    )
+    assert response.status_code == 200
+
+
+async def test_the_review_code_does_not_run_out(client, review_account):
+    for _ in range(3):
+        response = await client.post(
+            "/api/v1/auth/otp/verify",
+            json={"phone": REVIEW_PHONE, "code": REVIEW_CODE},
+        )
+        assert response.status_code == 200
+
+    assert response.json()["is_new_user"] is False
+
+
+async def test_the_review_number_refuses_any_other_code(client, review_account):
+    response = await client.post(
+        "/api/v1/auth/otp/verify", json={"phone": REVIEW_PHONE, "code": "000000"}
+    )
+    assert response.status_code == 401
+
+
+async def test_the_review_account_is_on_a_full_plan(client, review_account):
+    tokens = (
+        await client.post(
+            "/api/v1/auth/otp/verify",
+            json={"phone": REVIEW_PHONE, "code": REVIEW_CODE},
+        )
+    ).json()
+
+    me = await client.get(
+        "/api/v1/me", headers={"Authorization": f"Bearer {tokens['access_token']}"}
+    )
+
+    # Not the trial every other new account gets: a reviewer coming back months
+    # later must not meet the paywall.
+    assert me.json()["subscription"]["tier"] == "pro"
+
+
+async def test_the_fixed_code_is_inert_without_the_settings(client):
+    """With no review number configured, that number is an ordinary one."""
+    response = await client.post(
+        "/api/v1/auth/otp/verify", json={"phone": REVIEW_PHONE, "code": REVIEW_CODE}
+    )
+    assert response.status_code == 401

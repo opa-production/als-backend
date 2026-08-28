@@ -54,6 +54,14 @@ async def lifespan(app: FastAPI):
         # first screen of a container's logs.
         log.warning("feature_unavailable", detail=missing)
 
+    if settings.review_account_configured:
+        # Loud, and by name. One number that signs in with a fixed code and no
+        # SMS is a real hole in the auth story — a deliberate one, for the app
+        # store reviewers, but nobody should ever discover it by reading the
+        # source. It is a warning so it sits with the other things worth
+        # knowing in the first screen of the log.
+        log.warning("review_account_enabled", phone=settings.review_phone)
+
     log.info(
         "started",
         environment=settings.environment,

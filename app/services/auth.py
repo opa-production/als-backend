@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import secrets
 import uuid
 from datetime import timedelta
 
@@ -45,20 +46,82 @@ def normalise_phone(phone: str) -> str:
     return cleaned
 
 
+# --- The store review account ------------------------------------------------
+
+
+def is_review_phone(phone: str) -> bool:
+    """
+    Whether this is the number given to Google Play and App Store reviewers.
+
+    A reviewer cannot receive our SMS, so one declared number takes a fixed
+    code instead — see ``review_phone`` in app/core/config.py. Comparison is on
+    the normalised form so a reviewer typing the number with spaces still gets
+    in.
+    """
+    if not settings.review_account_configured:
+        return False
+    try:
+        return normalise_phone(phone) == normalise_phone(settings.review_phone)
+    except AppError:
+        # A malformed REVIEW_PHONE disables the account rather than matching
+        # everything that fails to normalise alongside it.
+        return False
+
+
+async def _grant_review_entitlement(session: AsyncSession, *, user: User) -> None:
+    """
+    Keeps the review account on a full plan that does not lapse.
+
+    The trial it was born with runs out after a fortnight, and an app store
+    review can come months after the account was made. A reviewer who signs in
+    to a paywall reports the app as broken, so this account is topped back up
+    to Synapse on every sign-in.
+
+    Written on sign-in rather than once at creation because the point is that
+    it is *never* expired when someone actually looks at it.
+    """
+    now = utc_now()
+    subscription = await session.scalar(
+        select(Subscription).where(Subscription.user_id == user.id)
+    )
+
+    if subscription is None:
+        subscription = Subscription(user_id=user.id, started_at=now)
+        session.add(subscription)
+
+    subscription.tier = Tier.PRO.value
+    subscription.expires_at = now + timedelta(days=365)
+    # Nothing was paid, and nothing is waiting on Kora to confirm it — an
+    # unverified paid tier reads as expired in `get_entitlement`.
+    subscription.verified = True
+
+    await session.flush()
+
+
 # --- One-time codes ----------------------------------------------------------
 
 
-async def request_otp(session: AsyncSession, *, phone: str) -> str:
+async def request_otp(session: AsyncSession, *, phone: str) -> str | None:
     """
     Mints a code and returns it, for the caller to send.
 
     Returning it rather than sending it here keeps this function free of the
     SMS provider, which is what lets the whole flow be tested without one.
 
+    Returns ``None`` for the store review number: its code is fixed and already
+    written in the review notes, so there is nothing to mint and nothing to
+    send. The caller must treat that as success — a reviewer, and anyone else
+    poking at the endpoint, sees exactly the response every other number gets.
+
     Throttled per number. An unthrottled send endpoint is a bill anyone can run
     up, and a way to use this service to text strangers.
     """
     phone = normalise_phone(phone)
+
+    if is_review_phone(phone):
+        log.info("otp_skipped_review_account", phone=phone)
+        return None
+
     now = utc_now()
 
     recent = await session.scalar(
@@ -111,6 +174,24 @@ async def verify_otp_code(
     phone = normalise_phone(phone)
     now = utc_now()
     generic = AppError("That code is not right, or it has expired.", status_code=401)
+
+    if is_review_phone(phone):
+        # The fixed code, compared without an early exit so the comparison
+        # itself gives nothing away. No OtpCode row is involved: none was
+        # written, and none should be, or a reviewer signing in would consume
+        # a code and the next attempt would fail.
+        if not secrets.compare_digest(code.strip(), settings.review_otp_code):
+            raise generic
+
+        user = await session.scalar(select(User).where(User.phone == phone))
+        if user is None:
+            user = await create_user(session, phone=phone, device_id=device_id)
+        else:
+            _reactivate(user)
+
+        await _grant_review_entitlement(session, user=user)
+        log.info("review_account_signed_in", user_id=str(user.id))
+        return user
 
     record = await session.scalar(
         select(OtpCode)

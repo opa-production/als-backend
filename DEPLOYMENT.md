@@ -164,6 +164,39 @@ rewrites the site in place to add TLS and the HTTP→HTTPS redirect. After that,
 edit `deploy/nginx.conf` here and re-run the `sed` above rather than hand-editing
 the installed file — then certbot again.
 
+**The catch-all.** `deploy/nginx-catchall.conf` answers everything that did not
+ask for the domain by name — the bare IP, and any other Host header — with 444,
+which closes the connection without a response. Without it those requests reach
+FastAPI and fill `journalctl -u als-backend` with 404s for `eval-stdin.php` and
+`/containers/json`, which is how a real error gets missed. No substitution; it
+names no domain:
+
+```bash
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo cp /opt/als-backend/deploy/nginx-catchall.conf \
+    /etc/nginx/sites-available/als-catchall
+sudo ln -sf /etc/nginx/sites-available/als-catchall /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+The `rm` matters: Debian's stock site already claims `listen 80 default_server`,
+and two blocks claiming it fails `nginx -t`. Install this *after* certbot has
+run — certbot chooses a block by `server_name`, and this one names nothing, but
+the 443 block here is a default that only makes sense once the API has its own.
+On nginx older than 1.19.4 (`nginx -v`; Ubuntu 22.04 ships 1.18) the
+`ssl_reject_handshake` line needs replacing — the file says what with.
+
+To confirm it works, from your laptop:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' http://<the-ip>/       # empty reply
+curl -sS -o /dev/null -w '%{http_code}\n' https://als.ardena.xyz/health
+```
+
+The first should fail with "Empty reply from server", which is 444 doing its
+job. The second must still return 200 — if it does not, the catch-all is
+shadowing the API and the `server_name` in the site is wrong.
+
 **The CI key.** A keypair whose public half is in `/home/als/.ssh/authorized_keys`
 and whose private half is the `VPS_SSH_KEY` repository secret. If SSH is already
 set up for this box, that key is whatever is already working — nothing here

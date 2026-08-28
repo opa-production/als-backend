@@ -263,3 +263,59 @@ def is_grounded(passages: list[Passage]) -> bool:
     if not passages:
         return False
     return passages[0].score >= settings.ai_retrieval_min_score
+
+
+#: How many chunks are taken from the front of each document for an overview.
+#: One is usually a title page; two reaches the first real paragraph.
+_LEAD_CHUNKS = 2
+
+
+async def lead_passages(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    unit_code: str | None,
+    limit: int | None = None,
+) -> list[Passage]:
+    """
+    The opening of each document in a unit, regardless of the question.
+
+    For the questions keyword search can never answer: "what is the pdf about",
+    "summarise my notes", "what did we cover in week three". Every content word
+    in those is about the *container*, so `search` matches nothing and the tutor
+    told the student it could not see their files — while their file sat in the
+    unit named on the same screen.
+
+    Deliberately not ranked against the question: there is nothing to rank
+    against. What it gives the model is the first page or so of each document,
+    which is where a title, a module outline and a lecture heading live, and
+    that is exactly what "what is this about" is asking for.
+    """
+    top_k = limit or settings.ai_retrieval_top_k
+
+    try:
+        async with session.begin_nested():
+            statement = (
+                _base_query(user_id, unit_code)
+                .where(MaterialChunk.ordinal < _LEAD_CHUNKS)
+                .order_by(MaterialChunk.material_id, MaterialChunk.ordinal)
+                .limit(top_k)
+            )
+            rows = (await session.execute(statement)).all()
+    except SQLAlchemyError:
+        log.exception("lead_passages_failed", user_id=str(user_id))
+        return []
+
+    return [
+        Passage(
+            material_id=row[0],
+            title=row[1],
+            unit_code=row[2],
+            page_number=row[3],
+            content=row[4],
+            # Not a match score — nothing was matched. Zero keeps `is_grounded`
+            # honest if these are ever mixed into a ranked list.
+            score=0.0,
+        )
+        for row in rows
+    ]

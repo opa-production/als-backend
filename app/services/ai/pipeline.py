@@ -7,9 +7,15 @@ where two nodes run at once:
 
                     ┌── classify ──┐
     question ───────┤              ├──→ route ──→ chat | grounded | general
-                    └── retrieve ──┘
+                    └── look up ───┘
 
-`classify` and `retrieve` do not depend on each other, so they run concurrently.
+`look up` is the database half: which unit is open and what is filed under it,
+then the passages that match the question. Both halves reach the prompt -- the
+context in every mode, because "which unit am I in" and "what is in my pdf" are
+questions the tutor used to answer with a flat denial while the answer sat in
+the request it was handed.
+
+`classify` and `look up` do not depend on each other, so they run concurrently.
 That matters: classification is a model round trip and retrieval is a database
 query, and running them in series would add the slower of the two to every
 single question for no reason.
@@ -39,7 +45,9 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.services.ai import context as context_service
 from app.services.ai import prompts, providers, retrieval
+from app.services.ai.context import StudentContext
 from app.services.ai.providers import Message, ModelSpec, Usage
 from app.services.ai.retrieval import Passage
 from app.services.ai.sanitise import StreamCleaner
@@ -62,6 +70,9 @@ class TutorState:
 
     intent: str = "COURSEWORK"
     passages: list[Passage] = field(default_factory=list)
+    #: The unit that is open and what is filed under it. Not what the material
+    #: says -- what there is.
+    context: StudentContext = field(default_factory=lambda: context_service.EMPTY)
 
     #: chat | grounded | general — set by `route`.
     mode: str = "general"
@@ -78,6 +89,7 @@ class Plan:
     passages: list[Passage]
     preamble: str
     spec: ModelSpec
+    context: StudentContext = field(default_factory=lambda: context_service.EMPTY)
 
 
 # --- Nodes -------------------------------------------------------------------
@@ -133,6 +145,36 @@ async def retrieve(state: TutorState, session: AsyncSession) -> list[Passage]:
         return []
 
 
+async def look_up(state: TutorState, session: AsyncSession) -> None:
+    """
+    Everything the database knows: the unit that is open, and the passages.
+
+    One node rather than two because they share a session, and an AsyncSession
+    is not safe to use from two coroutines at once — gathering them would
+    interleave two statements on one connection. They are cheap and sequential
+    here; the fan-out that matters is against the classifier's round trip.
+    """
+    state.context = await context_service.load(
+        session, user_id=state.user_id, unit_code=state.unit_code
+    )
+    state.passages = await retrieve(state, session)
+
+
+#: Words that make a question about the documents rather than about a subject.
+#: "What is the pdf about" has no content word to search for — every term in it
+#: names the container — so keyword retrieval can only ever come back empty.
+_ABOUT_MATERIAL = {
+    "pdf", "pdfs", "notes", "note", "material", "materials", "document",
+    "documents", "file", "files", "slide", "slides", "deck", "upload",
+    "uploaded", "uploads", "book", "textbook", "handout", "attachment",
+}
+
+
+def asks_about_material(question: str) -> bool:
+    """Whether the student is asking about their own documents as objects."""
+    return bool(set(retrieval.keywords(question)) & _ABOUT_MATERIAL)
+
+
 def route(state: TutorState) -> str:
     """
     Which kind of answer this is.
@@ -149,7 +191,9 @@ def route(state: TutorState) -> str:
 
 def compose(state: TutorState) -> list[Message]:
     """The prompt for the chosen mode."""
-    messages = [Message(role="system", content=prompts.system_for(state.mode))]
+    messages = [
+        Message(role="system", content=prompts.system_for(state.mode, state.context))
+    ]
 
     # Prior turns, so follow-ups work. Trimmed by the caller — this just places
     # them between the system prompt and the new question.
@@ -199,12 +243,31 @@ async def plan(
     )
 
     # The fan-out. Neither needs the other's result.
-    state.intent, state.passages = await asyncio.gather(
+    state.intent, _ = await asyncio.gather(
         classify(state, spec),
-        retrieve(state, session),
+        look_up(state, session),
     )
 
     state.mode = route(state)
+
+    if (
+        state.mode == "general"
+        and state.intent == "COURSEWORK"
+        and state.context.has_material
+        and asks_about_material(state.question)
+    ):
+        # "What is the pdf about". Nothing matched because there was nothing to
+        # match — the question is about the document, not about anything in it.
+        # Answering that from general knowledge and prefixing "I could not find
+        # this in your material" is how the tutor ended up telling a student it
+        # could not see a file that was sitting in the unit on screen. Hand it
+        # the front of each document instead and let it answer properly.
+        lead = await retrieval.lead_passages(
+            session, user_id=state.user_id, unit_code=state.unit_code
+        )
+        if lead:
+            state.passages = lead
+            state.mode = "grounded"
 
     if state.mode == "general" and state.intent == "COURSEWORK":
         # Only when the student could reasonably have expected their notes to
@@ -227,6 +290,7 @@ async def plan(
         passages=state.passages if state.mode == "grounded" else [],
         preamble=state.preamble,
         spec=spec,
+        context=state.context,
     )
 
 

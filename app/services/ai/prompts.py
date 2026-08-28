@@ -14,6 +14,7 @@ what the model actually meant to write.
 
 from __future__ import annotations
 
+from app.services.ai.context import StudentContext
 from app.services.ai.retrieval import Passage
 
 #: Repeated verbatim in every mode. The app has no markdown renderer, so every
@@ -58,9 +59,16 @@ not say something, it does not say it.
 GENERAL = f"""
 {VOICE}
 
-The student has asked a coursework question that their own uploaded material
-does not appear to cover. You have already told them so; do not repeat it or
-apologise again.
+The student has asked a coursework question that no passage of their own
+material matched. You have already told them so; do not repeat it or apologise
+again.
+
+Their unit and the material they have filed under it are described above. Never
+tell them you cannot see their files or which unit they have open — you can see
+both, and saying otherwise contradicts what is on their screen. What you do not
+have here is the text of a matching passage, and that is what to say if they
+push: you looked and nothing in those documents matched, not that they are
+invisible to you.
 
 Answer from your own knowledge, as accurately as you can. Where something is
 genuinely contested, or where the answer depends on which course or syllabus
@@ -80,8 +88,10 @@ The student has said something conversational — a greeting, an opinion questio
 something about how they are getting on, or a question about you. Answer it as
 that: briefly and like a person.
 
-Do not mention their uploaded notes, do not cite anything, and do not tell them
-what you cannot find. There is nothing to look up.
+Do not cite anything and do not tell them what you cannot find. There is
+nothing to look up. If they ask which unit they have open or what they have
+filed under it, answer from what is described above rather than saying you
+cannot see it.
 
 Keep it to a couple of sentences unless they have genuinely asked for more.
 
@@ -128,5 +138,59 @@ def build_passages_block(passages: list[Passage]) -> str:
     return "\n\n".join(parts)
 
 
-def system_for(mode: str) -> str:
-    return {"grounded": GROUNDED, "general": GENERAL, "chat": CHAT}[mode]
+def build_context_block(context: StudentContext) -> str:
+    """
+    Where the student is standing, in words the model can quote back.
+
+    Prepended to the system prompt in every mode, because the two questions it
+    answers — "which unit is this" and "what have I got in it" — are asked in
+    all three. Without it the tutor answered both with a denial: it cannot see
+    the screen, it cannot open PDFs. Both were true of the prompt it was given
+    and neither was true of the app.
+    """
+    if context.unit_code is None:
+        if not context.other_units:
+            return ""
+        units = "; ".join(context.other_units)
+        return (
+            "What you can see about this student: they have no unit open right "
+            f"now. The units they have set up are: {units}. If they ask about "
+            "one, ask them to open it so you can search inside it."
+        )
+
+    header = (
+        f"{context.unit_code} — {context.unit_title}"
+        if context.unit_title
+        else context.unit_code
+    )
+    lines = [
+        "What you can see about this student right now.",
+        f"The unit they have open is {header}. Refer to it by that code.",
+    ]
+
+    if context.materials:
+        listed = "; ".join(card.describe() for card in context.materials)
+        lines.append(f"The material they have filed under it: {listed}.")
+        lines.append(
+            "You know those documents exist and you may name them. You cannot "
+            "open one yourself — you only ever see passages that were searched "
+            "out and handed to you. So describe a document by its title when "
+            "asked what they have, and say you did not find a matching passage "
+            "when asked what is inside one and none was given to you. Never say "
+            "you cannot see their files."
+        )
+    else:
+        lines.append(
+            "They have nothing filed under it yet, so there is nothing of theirs "
+            "to quote. Say that plainly if it comes up."
+        )
+
+    return "\n".join(lines)
+
+
+def system_for(mode: str, context: StudentContext | None = None) -> str:
+    """The system prompt for a mode, with the student's situation on the front."""
+    base = {"grounded": GROUNDED, "general": GENERAL, "chat": CHAT}[mode]
+    block = build_context_block(context) if context is not None else ""
+    return f"{block}\n\n{base}" if block else base
+

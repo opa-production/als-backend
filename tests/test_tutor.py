@@ -218,7 +218,7 @@ async def test_a_covered_question_is_answered_from_the_material(client, fake_mod
     # The passages have to actually reach the model, or "grounded" is a label
     # on a prompt that never saw the notes.
     assert "Coffman" in fake_model.user_prompt
-    assert fake_model.system_prompt == prompts.GROUNDED
+    assert fake_model.system_prompt.endswith(prompts.GROUNDED)
 
     assert prompts.NOT_IN_MATERIAL not in _text(frames)
 
@@ -247,7 +247,7 @@ async def test_an_uncovered_question_says_so_before_answering(client, fake_model
     assert meta["grounded"] is False
     assert meta["sources"] == []
     assert answer.startswith(prompts.NOT_IN_MATERIAL)
-    assert fake_model.system_prompt == prompts.GENERAL
+    assert fake_model.system_prompt.endswith(prompts.GENERAL)
 
 
 async def test_small_talk_is_not_told_the_notes_came_up_short(client, fake_model):
@@ -704,3 +704,147 @@ async def test_asking_with_ids_that_already_exist_is_not_an_error(client, fake_m
         ).all()
 
     assert len(rows) == 2, f"the turn should exist once, found {len(rows)} rows"
+
+
+# --- What the tutor can see about the student ---------------------------------
+
+
+async def test_the_selected_unit_is_named_in_the_prompt(client, fake_model):
+    """
+    Asked which unit is open, the tutor used to say it could not see the screen.
+
+    It could: the code was in the request. It just never reached the prompt.
+    """
+    headers, user_id = await sign_in(client)
+    await _give_notes(client, user_id, code="COMP333", title="Week 1 slides")
+
+    response = await client.post(
+        "/api/v1/tutor/ask",
+        json={"question": "Can you see which unit is selected?", "unit_code": "COMP333"},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    system = fake_model.system_prompt
+    assert "COMP333" in system
+    assert "Operating Systems" in system
+    assert "Week 1 slides" in system
+
+
+async def test_the_students_documents_are_listed_even_when_nothing_matched(
+    client, fake_model
+):
+    """
+    A question the notes do not cover still gets the shelf.
+
+    Otherwise the tutor answers "who wrote Things Fall Apart" by volunteering
+    that it cannot see any uploaded files — which the student reads as the
+    upload having failed.
+    """
+    headers, user_id = await sign_in(client)
+    await _give_notes(client, user_id, code="COMP333", title="Week 1 slides")
+
+    response = await client.post(
+        "/api/v1/tutor/ask",
+        json={"question": "Who wrote Things Fall Apart?", "unit_code": "COMP333"},
+        headers=headers,
+    )
+
+    frames = _frames(response.text)
+    assert next(p for n, p in frames if n == "meta")["mode"] == "general"
+    assert "Week 1 slides" in fake_model.system_prompt
+
+
+async def test_small_talk_still_knows_which_unit_is_open(client, fake_model):
+    """The chat prompt gets the context too — "which unit am I in" is chat."""
+    headers, user_id = await sign_in(client)
+    await _give_notes(client, user_id, code="COMP333")
+    fake_model.verdict = "CHAT"
+
+    await client.post(
+        "/api/v1/tutor/ask",
+        json={"question": "hey, what am I revising?", "unit_code": "COMP333"},
+        headers=headers,
+    )
+
+    assert "COMP333" in fake_model.system_prompt
+
+
+async def test_a_question_about_the_pdf_itself_is_answered_from_the_pdf(
+    client, fake_model
+):
+    """
+    "What is the pdf about" has no searchable term in it.
+
+    Every content word names the container, so ranked retrieval returns nothing
+    and the honest-sounding answer — "I cannot see your uploaded PDFs" — is
+    false. The front of each document is handed over instead.
+    """
+    headers, user_id = await sign_in(client)
+    await _give_notes(client, user_id, code="COMP333")
+
+    response = await client.post(
+        "/api/v1/tutor/ask",
+        json={"question": "What is the pdf about?", "unit_code": "COMP333"},
+        headers=headers,
+    )
+
+    frames = _frames(response.text)
+    meta = next(payload for name, payload in frames if name == "meta")
+
+    assert meta["mode"] == "grounded"
+    assert meta["sources"], "the document it is describing has to be cited"
+    assert "Coffman" in fake_model.user_prompt
+    assert prompts.NOT_IN_MATERIAL not in _text(frames)
+
+
+async def test_a_question_about_a_pdf_that_does_not_exist_is_not_faked(
+    client, fake_model
+):
+    """No material means no overview — there is nothing to describe."""
+    headers, user_id = await sign_in(client)
+
+    response = await client.post(
+        "/api/v1/tutor/ask",
+        json={"question": "What is the pdf about?", "unit_code": "COMP333"},
+        headers=headers,
+    )
+
+    frames = _frames(response.text)
+    assert next(p for n, p in frames if n == "meta")["mode"] == "general"
+
+
+async def test_material_still_being_extracted_is_described_as_such(client, fake_model):
+    """
+    A pending upload is not a missing one.
+
+    Telling a student their file is not there, when it is and is still being
+    read, sends them to re-upload it.
+    """
+    headers, user_id = await sign_in(client)
+
+    async with client.sessions() as session:
+        unit = Unit(id=uuid.uuid4(), user_id=user_id, code="COMP333", title="OS")
+        session.add(unit)
+        await session.flush()
+        session.add(
+            Material(
+                id=uuid.uuid4(),
+                user_id=user_id,
+                unit_id=unit.id,
+                kind="pdf",
+                title="Fresh upload",
+                extraction_status="pending",
+            )
+        )
+        await session.commit()
+
+    await client.post(
+        "/api/v1/tutor/ask",
+        json={"question": "Explain deadlock", "unit_code": "COMP333"},
+        headers=headers,
+    )
+
+    system = fake_model.system_prompt
+    assert "Fresh upload" in system
+    assert "still being processed" in system

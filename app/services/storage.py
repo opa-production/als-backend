@@ -67,11 +67,18 @@ ALLOWED_MIME: dict[Bucket, frozenset[str]] = {
 
 #: Hard ceilings, independent of the plan. The plan limits sit *below* these
 #: and are checked separately; this is the "no matter who you are" line.
+#:
+#: Every one of these must stay at or under the bucket's own limit in Supabase,
+#: which is 50MB. A ceiling above it is worse than no ceiling: the file passes
+#: the check here, a URL is signed, the device uploads the whole thing, and
+#: Supabase refuses it at the end. The point of checking before signing is that
+#: a refusal costs the student nothing, and that is lost the moment these two
+#: numbers disagree. Materials and exports sat at 60MB and did exactly that.
 MAX_BYTES: dict[Bucket, int] = {
-    Bucket.MATERIALS: 60 * 1024 * 1024,
+    Bucket.MATERIALS: 50 * 1024 * 1024,
     Bucket.SCANS: 25 * 1024 * 1024,
     Bucket.AVATARS: 5 * 1024 * 1024,
-    Bucket.EXPORTS: 60 * 1024 * 1024,
+    Bucket.EXPORTS: 50 * 1024 * 1024,
 }
 
 

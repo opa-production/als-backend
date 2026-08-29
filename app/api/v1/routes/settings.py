@@ -1,15 +1,17 @@
 import uuid
-from datetime import date
+from datetime import date, datetime
 
 from fastapi import APIRouter, status
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 
-from app.api.deps import CurrentUser, DbSession
+from app.api.deps import CurrentUser, DbSession, HttpClient
 from app.core.clock import now as utc_now
 from app.core.errors import NotFound
 from app.models.account import Device
+from app.models.notification import NotificationLog
 from app.models.settings import UserSettings
+from app.services import notifications as notification_service
 from app.services import streak as streak_service
 from app.services.plans import UNLIMITED, plan_for
 from app.services.quota import current_usage, get_entitlement
@@ -168,6 +170,79 @@ async def forget_device(
     await session.flush()
 
 
+# --- Notifications ------------------------------------------------------------
+
+
+class TestPushOut(BaseModel):
+    #: How many devices actually took it. Zero with `has_devices` true is the
+    #: interesting case: a token that is registered but no longer live.
+    delivered: int
+    has_devices: bool
+
+
+@router.post(
+    "/push/test", response_model=TestPushOut, summary="Send yourself a notification"
+)
+async def test_push(
+    user: CurrentUser, session: DbSession, client: HttpClient
+) -> TestPushOut:
+    """
+    Sends a notification to every device on this account, immediately.
+
+    "Are notifications working" is otherwise unanswerable without waiting for a
+    real deadline — permission, the token, the Expo project and its credentials
+    all fail the same silent way. Quiet hours are ignored: this was asked for by
+    the person holding the phone.
+    """
+    devices = await session.scalar(
+        select(func.count())
+        .select_from(Device)
+        .where(Device.user_id == user.id, Device.push_token.is_not(None))
+    )
+
+    delivered = await notification_service.send_test(
+        session, user_id=user.id, client=client
+    )
+
+    return TestPushOut(delivered=delivered, has_devices=bool(devices))
+
+
+class NotificationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    kind: str
+    title: str
+    body: str
+    status: str
+    scheduled_for: datetime | None
+    sent_at: datetime | None
+
+
+@router.get(
+    "/notifications",
+    response_model=list[NotificationOut],
+    summary="Reminders recently sent to you",
+)
+async def read_notifications(
+    user: CurrentUser, session: DbSession, limit: int = 50
+) -> list[NotificationOut]:
+    """
+    What the server has sent, newest first.
+
+    Push is fire-and-forget — a notification that arrives while the phone is off
+    is simply gone — so this is the app's in-app list, and the only way a
+    student can see a reminder they missed.
+    """
+    rows = await session.scalars(
+        select(NotificationLog)
+        .where(NotificationLog.user_id == user.id)
+        .order_by(NotificationLog.created_at.desc())
+        .limit(max(1, min(limit, 100)))
+    )
+    return [NotificationOut.model_validate(row) for row in rows]
+
+
 # --- Streak -------------------------------------------------------------------
 
 
@@ -251,8 +326,6 @@ async def read_usage(user: CurrentUser, session: DbSession) -> UsageOut:
     Served from the same config the limits are enforced from, so the bars a
     student sees cannot disagree with the refusal they get.
     """
-    from sqlalchemy import func
-
     from app.models.course import Unit
 
     entitlement = await get_entitlement(session, user.id)

@@ -115,6 +115,30 @@ class Settings(BaseSettings):
     def sms_configured(self) -> bool:
         return bool(self.sms_api_key and self.sms_partner_id)
 
+    # --- Push notifications -----------------------------------------------
+    #
+    # Expo's push service needs no credential to accept a send, which makes a
+    # key a bad switch: there would be nothing to leave unset in development,
+    # and every test run would fire real notifications at whatever tokens the
+    # database happened to hold. So the switch is explicit. Off means the
+    # reminder sweep still runs and still decides what to send — it writes the
+    # notification to the log instead of the handset.
+    push_enabled: bool = False
+    #: Only needed once the Expo project turns on enhanced security. Sent as a
+    #: bearer token when present, ignored when not.
+    expo_access_token: str = ""
+    #: How long Expo may keep trying. A class reminder is worthless an hour
+    #: late, so this is deliberately short rather than the multi-day default.
+    push_ttl_seconds: int = 1800
+
+    #: Minutes between reminder sweeps. Also the granularity of a reminder: a
+    #: 15-minute lead lands somewhere in the minute before, never earlier.
+    reminder_sweep_seconds: int = 60
+
+    @property
+    def push_configured(self) -> bool:
+        return self.push_enabled
+
     # --- The store review account -----------------------------------------
     #
     # Google Play and the App Store both want a working login in the review
@@ -342,6 +366,11 @@ class Settings(BaseSettings):
             missing.append(
                 "SMS_API_KEY / SMS_PARTNER_ID are not set — sign-in codes are "
                 "written to the log instead of sent"
+            )
+        if not self.push_configured:
+            missing.append(
+                "PUSH_ENABLED is off — deadline and class reminders are decided "
+                "and logged, but no notification reaches a handset"
             )
         if not self.google_client_ids:
             missing.append("GOOGLE_CLIENT_IDS is not set — /auth/google will refuse")

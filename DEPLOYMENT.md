@@ -289,6 +289,27 @@ test signup before the Celcom account is live:
 journalctl -u als-backend -f
 ```
 
+**Reminders go to the journal** while `PUSH_ENABLED=false`. The sweep still
+runs on the worker every minute and still decides what to send — it writes the
+notification out instead of handing it to Expo, so the scheduling can be watched
+before any handset is involved:
+
+```bash
+journalctl -u als-worker -f | grep -E 'push_|reminder_sweep'
+```
+
+Turning it on is one variable, because Expo accepts a send with no credential:
+
+```bash
+PUSH_ENABLED=true
+# Only if the Expo project has enhanced security switched on:
+EXPO_ACCESS_TOKEN=
+```
+
+Reminders are sent by the **worker**, not the API. A box running only
+`als-backend` serves every request correctly and never notifies anybody, which
+looks exactly like push being broken — check `als-worker` first.
+
 **The app store review account.** Google Play and the App Store both ask for a
 working login in the review notes, and this product has none to give: sign-in is
 Google, or a code texted to a phone the reviewer does not hold. Two variables in

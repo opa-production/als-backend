@@ -28,6 +28,7 @@ import structlog
 from app.core.config import settings
 from app.core.logging import configure_logging
 from app.db.session import SessionLocal, dispose_engine
+from app.services import notifications
 from app.workers import extraction
 
 log = structlog.get_logger()
@@ -49,6 +50,9 @@ ERROR_BACKOFF = 30.0
 class Worker:
     def __init__(self) -> None:
         self._stopping = asyncio.Event()
+        #: When the next reminder sweep is allowed to run. Zero means "now", so
+        #: a restart notices anything that came due while the process was down.
+        self._next_sweep = 0.0
 
     def stop(self) -> None:
         """Finish the document in hand, then exit."""
@@ -68,7 +72,22 @@ class Worker:
                 "nothing can be downloaded, so nothing will be extracted",
             )
 
-        log.info("worker_started", batch=BATCH, idle_seconds=IDLE_SECONDS)
+        if not settings.push_configured:
+            # Same shape as the storage warning: the sweep still runs and still
+            # decides what to send, it just writes it to the log instead of a
+            # handset. Said once, so "why did nobody get a reminder" has an
+            # answer at the top of the journal.
+            log.warning(
+                "worker_push_unconfigured",
+                detail="PUSH_ENABLED is off — reminders will be logged, not sent",
+            )
+
+        log.info(
+            "worker_started",
+            batch=BATCH,
+            idle_seconds=IDLE_SECONDS,
+            sweep_seconds=settings.reminder_sweep_seconds,
+        )
 
         # One client for the process, like the API's. A client per document
         # re-does TLS every time and leaks sockets until the process runs out.
@@ -92,6 +111,8 @@ class Worker:
 
     async def _tick(self, client: httpx.AsyncClient) -> bool:
         """One pass. Returns whether there was anything to do."""
+        await self._sweep_reminders(client)
+
         async with SessionLocal() as session:
             await extraction.requeue_stalled(session)
             ids = await extraction.claim_batch(session, BATCH)
@@ -111,6 +132,34 @@ class Worker:
                 await extraction.extract_material(session, material_id, client=client)
 
         return True
+
+    async def _sweep_reminders(self, client: httpx.AsyncClient) -> None:
+        """
+        Send anything that has come due, at most once a minute.
+
+        It rides on the extraction loop rather than running as a second process:
+        both are "wake up, do a little work, sleep", and a separate service is
+        another unit to keep alive, watch and restart for a job that is one
+        indexed query most minutes.
+
+        Its own cadence, though. The extraction loop wakes every five seconds,
+        and sweeping that often would be sixty times the queries for a
+        granularity nobody can perceive.
+
+        Failures are swallowed here so a reminder problem cannot stop documents
+        being extracted — the two jobs share a loop, not a fate.
+        """
+        loop_now = asyncio.get_running_loop().time()
+        if loop_now < self._next_sweep:
+            return
+
+        self._next_sweep = loop_now + settings.reminder_sweep_seconds
+
+        try:
+            async with SessionLocal() as session:
+                await notifications.sweep(session, client=client)
+        except Exception:  # noqa: BLE001 — extraction must outlive this
+            log.exception("reminder_sweep_failed")
 
     async def _sleep(self, seconds: float) -> None:
         """

@@ -167,3 +167,68 @@ async def test_a_stop_mid_batch_leaves_the_rest_for_the_next_pass(monkeypatch, c
     await asyncio.wait_for(worker.run(), timeout=5)
 
     assert len(seen) == 1, "the batch should stop after the document in hand"
+
+
+# --- The reminder sweep -------------------------------------------------------
+#
+# It rides on this loop rather than running as a second service, which buys one
+# unit to keep alive instead of two and costs the two properties below: the
+# sweep must not run at the extraction loop's cadence, and it must not be able
+# to take extraction down with it.
+
+
+async def test_the_sweep_runs_on_its_own_cadence(monkeypatch):
+    """
+    The loop wakes every five seconds; sweeping that often would be sixty times
+    the queries for a granularity nobody can perceive.
+    """
+    sweeps = {"count": 0}
+
+    async def counting_sweep(session, **kwargs):
+        sweeps["count"] += 1
+        return 0
+
+    monkeypatch.setattr("app.services.notifications.sweep", counting_sweep)
+    monkeypatch.setattr("app.workers.runner.SessionLocal", _NullSessions)
+
+    worker = Worker()
+    client = object()
+
+    await worker._sweep_reminders(client)
+    # Same second: the interval has not elapsed, so this must be a no-op.
+    await worker._sweep_reminders(client)
+
+    assert sweeps["count"] == 1
+
+    # Pretending the interval has passed is the only part of the clock this
+    # needs to fake — the cadence lives in one comparison.
+    worker._next_sweep = 0.0
+    await worker._sweep_reminders(client)
+
+    assert sweeps["count"] == 2
+
+
+async def test_a_failing_sweep_does_not_stop_extraction(monkeypatch):
+    """
+    The two jobs share a loop, not a fate. A reminder bug at 3am must not be the
+    reason a week of uploads sits at `pending`.
+    """
+
+    async def exploding_sweep(session, **kwargs):
+        raise RuntimeError("expo is down")
+
+    monkeypatch.setattr("app.services.notifications.sweep", exploding_sweep)
+    monkeypatch.setattr("app.workers.runner.SessionLocal", _NullSessions)
+
+    worker = Worker()
+    await worker._sweep_reminders(object())  # must not raise
+
+
+class _NullSessions:
+    """A session context manager that yields nothing real."""
+
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, *exc):
+        return False

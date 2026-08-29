@@ -121,6 +121,7 @@ def test_a_fully_configured_production_warns_about_nothing():
         google_client_ids=["client-id"],
         cors_origins=["https://admin.ardena.xyz"],
         deepseek_api_key="sk-live",
+        push_enabled=True,
     )
 
     assert settings.unavailable_features() == []

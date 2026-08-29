@@ -20,6 +20,7 @@ from app.models.billing import (
 )
 from app.models.course import ClassSession, Unit
 from app.models.knowledge import Material, MaterialChunk
+from app.models.notification import NotificationLog
 from app.models.planner import Event
 from app.models.settings import StudyDay, UserSettings
 from app.models.trial import TrialGrant
@@ -37,6 +38,7 @@ __all__ = [
     "Material",
     "MaterialChunk",
     "Message",
+    "NotificationLog",
     "OtpCode",
     "Payment",
     "PlanGroup",

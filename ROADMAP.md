@@ -45,7 +45,7 @@ live.
 | `POST /billing/webhook` | Kora webhook secret. **This is what makes a subscription real** — the app currently writes `verified: false` on a student's word. |
 | Friends group: create / invite / join / members | Seat accounting. |
 | Usage counters and enforcement | Mirrors `src/theme/plans.js`, with the server as the authority. |
-| Notification scheduling | Expo push tokens. |
+| Reminders: `POST /me/push/test`, `GET /me/notifications` | Expo. The sweep lives on the worker (`app/services/notifications.py`); `PUSH_ENABLED` decides whether a decided reminder reaches a handset or only the log. **Implemented.** |
 
 ---
 

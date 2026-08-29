@@ -1,4 +1,5 @@
-# systemd unit for the ALS extraction worker.
+# systemd unit for the ALS background worker: PDF extraction, and the reminder
+# sweep that sends deadline and class notifications.
 #
 # Installed by hand — see DEPLOYMENT.md section 2. Edit it here, copy it to
 # /etc/systemd/system/, then `systemctl daemon-reload`.
@@ -6,9 +7,13 @@
 # A separate process from the API, deliberately: PDF parsing is CPU-bound, and
 # a handler that blocks the event loop stalls every other request on that
 # process. See ARCHITECTURE.md §3.
+#
+# Reminders ride on the same loop rather than a second unit. Both jobs are
+# "wake, do a little work, sleep", and a service that is down is a service
+# nobody notices is down — one is easier to keep alive than two.
 
 [Unit]
-Description=ALS extraction worker
+Description=ALS background worker (extraction, reminders)
 After=network-online.target
 Wants=network-online.target
 # Not Requires=: the worker is useful on its own and the API is useful without

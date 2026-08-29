@@ -6,7 +6,7 @@ take a state and return a state, a router that picks an edge, and a fan-out
 where two nodes run at once:
 
                     ┌── classify ──┐
-    question ───────┤              ├──→ route ──→ chat | grounded | general
+    question ───────┤              ├──→ route ──→ chat | grounded | blended | general
                     └── look up ───┘
 
 `look up` is the database half: which unit is open and what is filed under it,
@@ -29,9 +29,18 @@ file and nothing else.
 
 Why classify with a model at all, rather than keywords: "what do you think about
 computer science" is a coursework question by every keyword test and an opinion
-question to any reader. Getting that wrong means answering small talk with "I
-could not find this in your material", which is the exact failure this whole
-pipeline exists to avoid.
+question to any reader. Getting that wrong used to mean answering small talk
+with "I could not find this in your material".
+
+Nothing says that any more. The tutor used to prefix an unmatched coursework
+answer with a fixed apology, which made the most common thing a student read
+first a report on a database miss — in a unit with nothing uploaded, every
+single answer opened with it. Retrieval now only ever *adds*: a strong match is
+answered from the material and cited, a weak one is handed over as optional
+support the model may ignore in silence, and no match at all is simply answered.
+Whether an answer came from the notes is carried by its citations and by the
+`meta` frame, which the app has before the first token — not by a sentence of
+throat-clearing in front of the answer.
 """
 
 from __future__ import annotations
@@ -50,7 +59,7 @@ from app.services.ai import prompts, providers, retrieval
 from app.services.ai.context import StudentContext
 from app.services.ai.providers import Message, ModelSpec, Usage
 from app.services.ai.retrieval import Passage
-from app.services.ai.sanitise import StreamCleaner
+from app.services.ai.sanitise import OpenerGuard, StreamCleaner
 
 log = structlog.get_logger()
 
@@ -74,10 +83,8 @@ class TutorState:
     #: says -- what there is.
     context: StudentContext = field(default_factory=lambda: context_service.EMPTY)
 
-    #: chat | grounded | general — set by `route`.
+    #: chat | grounded | blended | general — set by `route`.
     mode: str = "general"
-    #: Prepended to the answer when the material came up short.
-    preamble: str = ""
 
 
 @dataclass
@@ -87,7 +94,6 @@ class Plan:
     mode: str
     messages: list[Message]
     passages: list[Passage]
-    preamble: str
     spec: ModelSpec
     context: StudentContext = field(default_factory=lambda: context_service.EMPTY)
 
@@ -139,8 +145,9 @@ async def retrieve(state: TutorState, session: AsyncSession) -> list[Passage]:
         )
     except Exception as error:  # noqa: BLE001
         # A retrieval failure should degrade to answering from general
-        # knowledge, not to failing the request. The student gets an answer and
-        # an honest note that their material was not consulted.
+        # knowledge, not to failing the request. The student gets an answer;
+        # what they lose is the citations, and the log is where that is
+        # noticed, not the reply.
         log.warning("tutor_retrieval_failed", error=str(error))
         return []
 
@@ -180,13 +187,21 @@ def route(state: TutorState) -> str:
     Which kind of answer this is.
 
     Chat wins outright — there is nothing to look up, so retrieval results are
-    irrelevant even when they exist. Otherwise the retrieval score decides, and
-    that single comparison is the whole "I could not find this in your
-    material" behaviour.
+    irrelevant even when they exist. Otherwise the top retrieval score picks one
+    of three: material that answers the question, material that is merely near
+    it, and nothing.
+
+    The bottom of that ladder is a plain answer, not a refusal. A question the
+    notes do not cover is still a question, and a unit with nothing filed under
+    it is still a place to ask one.
     """
     if state.intent == "CHAT":
         return "chat"
-    return "grounded" if retrieval.is_grounded(state.passages) else "general"
+    if retrieval.is_grounded(state.passages):
+        return "grounded"
+    if retrieval.is_worth_offering(state.passages):
+        return "blended"
+    return "general"
 
 
 def compose(state: TutorState) -> list[Message]:
@@ -199,7 +214,7 @@ def compose(state: TutorState) -> list[Message]:
     # them between the system prompt and the new question.
     messages.extend(state.history)
 
-    if state.mode == "grounded":
+    if state.mode in {"grounded", "blended"}:
         messages.append(
             Message(
                 role="user",
@@ -251,29 +266,23 @@ async def plan(
     state.mode = route(state)
 
     if (
-        state.mode == "general"
+        state.mode in {"general", "blended"}
         and state.intent == "COURSEWORK"
         and state.context.has_material
         and asks_about_material(state.question)
     ):
         # "What is the pdf about". Nothing matched because there was nothing to
         # match — the question is about the document, not about anything in it.
-        # Answering that from general knowledge and prefixing "I could not find
-        # this in your material" is how the tutor ended up telling a student it
-        # could not see a file that was sitting in the unit on screen. Hand it
-        # the front of each document instead and let it answer properly.
+        # Answering that from general knowledge is how the tutor ended up
+        # telling a student it could not see a file that was sitting in the unit
+        # on screen. Hand it the front of each document instead and let it
+        # answer properly.
         lead = await retrieval.lead_passages(
             session, user_id=state.user_id, unit_code=state.unit_code
         )
         if lead:
             state.passages = lead
             state.mode = "grounded"
-
-    if state.mode == "general" and state.intent == "COURSEWORK":
-        # Only when the student could reasonably have expected their notes to
-        # cover it. Saying "I could not find this in your material" in reply to
-        # "hello" would be absurd, and `route` has already separated those.
-        state.preamble = prompts.NOT_IN_MATERIAL
 
     log.info(
         "tutor_plan",
@@ -287,8 +296,11 @@ async def plan(
     return Plan(
         mode=state.mode,
         messages=compose(state),
+        # Cited to the student only when the answer is actually built from
+        # them. A `blended` answer may use one passage, or none, and the model
+        # is the only thing that knows which — so a source header there would
+        # be claiming a provenance the answer might not have.
         passages=state.passages if state.mode == "grounded" else [],
-        preamble=state.preamble,
         spec=spec,
         context=state.context,
     )
@@ -298,15 +310,13 @@ async def generate(plan_: Plan) -> AsyncIterator[str]:
     """
     The answer, cleaned, as it arrives.
 
-    The preamble is yielded before the model is even called, so a student
-    learns immediately that this one is not from their notes rather than
-    reading a paragraph first and finding out afterwards.
+    Nothing is prepended. Whatever the model says first is what the student
+    reads first, and `OpenerGuard` is there to make sure that is not a report on
+    what the search did not turn up.
     """
-    if plan_.preamble:
-        yield plan_.preamble
-
     provider = providers.provider_for(plan_.spec)
     cleaner = StreamCleaner()
+    guard = OpenerGuard()
 
     async for chunk in provider.stream(
         plan_.messages,
@@ -314,11 +324,11 @@ async def generate(plan_: Plan) -> AsyncIterator[str]:
         max_tokens=settings.ai_max_output_tokens,
         temperature=settings.ai_temperature,
     ):
-        cleaned = cleaner.feed(chunk)
+        cleaned = guard.feed(cleaner.feed(chunk))
         if cleaned:
             yield cleaned
 
-    tail = cleaner.flush()
+    tail = guard.feed(cleaner.flush()) + guard.flush()
     if tail:
         yield tail
 

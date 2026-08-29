@@ -265,6 +265,31 @@ def is_grounded(passages: list[Passage]) -> bool:
     return passages[0].score >= settings.ai_retrieval_min_score
 
 
+#: How far below the grounding threshold a passage may sit and still be worth
+#: putting in front of the model as *optional* support.
+#:
+#: The band between this and `ai_retrieval_min_score` is the material that is
+#: plainly about the right subject but does not answer the question — a lecture
+#: that mentions deadlock in passing when the question is about detection
+#: algorithms. Grounding an answer in it would be a lie; throwing it away loses
+#: the one thing the tutor has that a general chatbot does not, which is the
+#: student's own lecturer's wording. So it is offered, and the model decides.
+_OFFER_FRACTION = 0.4
+
+
+def is_worth_offering(passages: list[Passage]) -> bool:
+    """
+    Whether the material is close enough to be worth showing the model at all.
+
+    Below this there is no signal left — a single shared stop-word-ish term in a
+    six-thousand-word document — and passing it on would only invite a citation
+    of something the student's notes never said.
+    """
+    if not passages:
+        return False
+    return passages[0].score >= settings.ai_retrieval_min_score * _OFFER_FRACTION
+
+
 #: How many chunks are taken from the front of each document for an overview.
 #: One is usually a title page; two reaches the first real paragraph.
 _LEAD_CHUNKS = 2

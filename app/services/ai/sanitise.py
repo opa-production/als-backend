@@ -1,6 +1,10 @@
 """
 Turning model output into plain prose, as it streams.
 
+Two jobs, both of them things the system prompt already asked for and the model
+did anyway: stripping markdown, and stripping an opening sentence that reports
+what the search did not find.
+
 The app renders answers as plain text. It has no markdown renderer, so a model
 that reaches for ``**bold**`` and ``- bullets`` puts literal asterisks and
 hyphens on a student's screen — which reads as the tutor being broken rather
@@ -222,3 +226,135 @@ class StreamCleaner:
             return ""
 
         return _apply_inline(_apply_line_start(text))
+
+
+# --- The opening sentence -----------------------------------------------------
+#
+# The prompts forbid opening with what could not be found. Models do it anyway,
+# because "I could not find that in the provided context" is the most rehearsed
+# sentence in every RAG corpus they were trained on. It is also the one sentence
+# a student must never read first: it turns an answer the tutor is about to give
+# perfectly well into a report on a database miss, and in a unit with nothing
+# uploaded it would open every single reply.
+#
+# So it is removed. Only at the very start, only one sentence, and only when it
+# is about their material — "I do not know" is a different sentence and an
+# honest one, and it stays.
+
+#: How far in to look for the end of the first sentence. Past this, the opener
+#: is not a disclaimer, it is the answer, and holding text back to inspect it
+#: only delays the first thing on the screen.
+_OPENER_LIMIT = 240
+
+_SOURCE = (
+    r"(?:material|materials|note|notes|document|documents|pdf|pdfs|file|files|"
+    r"upload|uploads|slide|slides|handout|handouts|passage|passages|excerpt|"
+    r"excerpts|context|knowledge\s+base|course\s+content)"
+)
+
+_SORRY = r"(?:unfortunately|sorry|apologies|i\s*['\u2019]?m\s+sorry)[,:\s]+"
+
+_NEGATED = (
+    r"(?:could\s*not|couldn['\u2019]?t|cannot|can\s*not|can['\u2019]?t|do\s*not|"
+    r"don['\u2019]?t|did\s*not|didn['\u2019]?t|was\s+not\s+able\s+to|"
+    r"wasn['\u2019]?t\s+able\s+to|am\s+unable\s+to|have\s+no|found\s+no|see\s+no)"
+)
+
+#: Every one of these requires the sentence to name the student's material. That
+#: is what keeps "I do not know" and "I cannot be certain" — honest sentences,
+#: worth reading — out of the net.
+_DISCLAIMERS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        # "I could not find anything about this in your notes."
+        rf"^\s*(?:{_SORRY})?(?:i|we)\s+{_NEGATED}\b[^.!?\n]*\b{_SOURCE}\b[^.!?\n]*[.!?]+",
+        # "There is nothing in your material about deadlock."
+        rf"^\s*(?:{_SORRY})?there\s+(?:is|are|was|were)\s+(?:no|nothing|not)\b"
+        rf"[^.!?\n]*\b{_SOURCE}\b[^.!?\n]*[.!?]+",
+        # "Your CS201 notes do not cover this." / "The provided context does not
+        # mention it." The words between the determiner and the noun are the
+        # unit code and whatever else the model felt like naming.
+        rf"^\s*(?:{_SORRY})?(?:your|the|these|those)\s+(?:[\w'-]+\s+){{0,4}}"
+        rf"{_SOURCE}\b[^.!?\n]*\b(?:do|does|did)\s*(?:not|n['\u2019]?t)\b"
+        rf"[^.!?\n]*[.!?]+",
+        # "Nothing in your uploaded material matched this question."
+        rf"^\s*(?:{_SORRY})?(?:nothing|none)\b[^.!?\n]*\b{_SOURCE}\b[^.!?\n]*[.!?]+",
+    )
+)
+
+_SENTENCE_END = re.compile(r"[.!?]")
+
+
+class OpenerGuard:
+    """
+    Drops a disclaimer if the model opens with one, then gets out of the way.
+
+    Holds text back only until the first sentence is decidable — one sentence of
+    latency, once, at the very start of an answer — and is a plain pass-through
+    for the rest of the stream after that. A disclaimer the model puts *later*
+    is left alone: by then it is a caveat inside an answer the student is
+    already reading, which is a different and reasonable thing to write.
+
+    The same invariant as `StreamCleaner`: chunking must not change the output.
+    That is why the decision is made against a fixed-length head of the buffer
+    rather than against however much text happens to have arrived by then.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._done = False
+        #: Set when a disclaimer was dropped and the text following it had not
+        #: arrived yet, so the whitespace it left behind is still to be eaten.
+        self._trim_next = False
+
+    def feed(self, text: str) -> str:
+        if self._done:
+            return self._passthrough(text)
+        if not text:
+            return ""
+
+        self._buffer += text
+        head = self._buffer[:_OPENER_LIMIT]
+
+        if _SENTENCE_END.search(head):
+            return self._resolve(head)
+
+        if len(self._buffer) >= _OPENER_LIMIT:
+            # No sentence ends inside the window, so no disclaimer can match.
+            return self._release(self._buffer)
+
+        return ""
+
+    def flush(self) -> str:
+        """Whatever is still held, once the stream has ended."""
+        if self._done:
+            return ""
+        head = self._buffer[:_OPENER_LIMIT]
+        if _SENTENCE_END.search(head):
+            return self._resolve(head)
+        return self._release(self._buffer)
+
+    def _resolve(self, head: str) -> str:
+        """Decide on a head that contains the end of the first sentence."""
+        tail = self._buffer[len(head):]
+
+        for pattern in _DISCLAIMERS:
+            match = pattern.match(head)
+            if match:
+                return self._release(head[match.end():] + tail, trim=True)
+
+        return self._release(head + tail)
+
+    def _release(self, text: str, *, trim: bool = False) -> str:
+        self._buffer = ""
+        self._done = True
+        if trim:
+            self._trim_next = True
+        return self._passthrough(text)
+
+    def _passthrough(self, text: str) -> str:
+        if self._trim_next:
+            text = text.lstrip()
+            if text:
+                self._trim_next = False
+        return text

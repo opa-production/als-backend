@@ -5,9 +5,11 @@ Three things are worth pinning here, and they are the three that decide whether
 a student can trust an answer:
 
 * **Grounding.** A question the notes cover is answered from them and cites
-  them. A question they do not cover says so, in those words, before answering.
+  them. A question they do not cover is answered anyway, from general
+  knowledge, without a word about what the search did not turn up.
 * **Intent.** "Hello" and "what do you think about computer science" are not
-  coursework, and must not be met with "I could not find that in your material".
+  coursework, and must not be met with "I could not find that in your material"
+  — which nothing says any more, in any mode, by design.
 * **Isolation.** Retrieval never crosses accounts. This is the one failure in
   the whole system that would be unforgivable.
 
@@ -27,7 +29,7 @@ from app.models.course import Unit
 from app.models.knowledge import Material, MaterialChunk
 from app.services.ai import pipeline, prompts, providers, retrieval
 from app.services.ai.providers import Message, Usage
-from app.services.ai.sanitise import StreamCleaner
+from app.services.ai.sanitise import OpenerGuard, StreamCleaner
 from tests.conftest import OTHER_PHONE, sign_in
 
 NOTES = (
@@ -220,18 +222,21 @@ async def test_a_covered_question_is_answered_from_the_material(client, fake_mod
     assert "Coffman" in fake_model.user_prompt
     assert fake_model.system_prompt.endswith(prompts.GROUNDED)
 
-    assert prompts.NOT_IN_MATERIAL not in _text(frames)
 
-
-async def test_an_uncovered_question_says_so_before_answering(client, fake_model):
+async def test_an_uncovered_question_is_simply_answered(client, fake_model):
     """
-    The behaviour this whole pipeline exists for.
+    The behaviour this whole pipeline used to get wrong.
 
-    The student is told the notes came up short *first* — not after a paragraph
-    they have already started believing came from their own material.
+    A question the notes do not cover is still a question. It used to be
+    answered with a fixed "I could not find anything about this in your
+    material" glued to the front, which made a report on a database miss the
+    first thing a student read — every time, and in a unit with nothing
+    uploaded, on every single answer. Now the answer is the answer, and the
+    `meta` frame is where the app learns it was not grounded.
     """
     headers, user_id = await sign_in(client)
     await _give_notes(client, user_id)
+    fake_model.reply = "Chinua Achebe wrote it in 1958."
 
     response = await client.post(
         "/api/v1/tutor/ask",
@@ -241,12 +246,11 @@ async def test_an_uncovered_question_says_so_before_answering(client, fake_model
 
     frames = _frames(response.text)
     meta = next(payload for name, payload in frames if name == "meta")
-    answer = _text(frames)
 
     assert meta["mode"] == "general"
     assert meta["grounded"] is False
     assert meta["sources"] == []
-    assert answer.startswith(prompts.NOT_IN_MATERIAL)
+    assert _text(frames) == "Chinua Achebe wrote it in 1958."
     assert fake_model.system_prompt.endswith(prompts.GENERAL)
 
 
@@ -268,7 +272,6 @@ async def test_small_talk_is_not_told_the_notes_came_up_short(client, fake_model
     meta = next(payload for name, payload in frames if name == "meta")
 
     assert meta["mode"] == "chat"
-    assert prompts.NOT_IN_MATERIAL not in _text(frames)
     assert fake_model.system_prompt == prompts.CHAT
     assert not fake_model.complete_calls, "a bare greeting should not cost a classifier call"
 
@@ -293,7 +296,6 @@ async def test_an_opinion_question_is_chat_not_coursework(client, fake_model):
     meta = next(payload for name, payload in frames if name == "meta")
 
     assert meta["mode"] == "chat"
-    assert prompts.NOT_IN_MATERIAL not in _text(frames)
 
 
 async def test_a_classifier_failure_falls_back_to_coursework(client, fake_model, monkeypatch):
@@ -317,6 +319,105 @@ async def test_a_classifier_failure_falls_back_to_coursework(client, fake_model,
 
     meta = next(p for n, p in _frames(response.text) if n == "meta")
     assert meta["mode"] == "grounded"
+
+
+# --- Material that is near the question without answering it -------------------
+
+
+def _passage(score: float) -> retrieval.Passage:
+    return retrieval.Passage(
+        material_id=uuid.uuid4(),
+        title="Week 4 notes",
+        unit_code="CS201",
+        page_number=4,
+        content=NOTES,
+        score=score,
+    )
+
+
+def _state(passages) -> pipeline.TutorState:
+    state = pipeline.TutorState(question="What is a deadlock?", user_id=uuid.uuid4())
+    state.passages = passages
+    return state
+
+
+def test_a_near_miss_is_offered_rather_than_thrown_away():
+    """
+    Between "answers it" and "nothing" there is material worth showing.
+
+    A lecture that mentions deadlock while the question is about detection
+    algorithms cannot ground an answer, but it is the one thing the tutor has
+    that a general chatbot does not: this student's own lecturer's wording.
+    """
+    below = settings.ai_retrieval_min_score * 0.6
+    assert pipeline.route(_state([_passage(below)])) == "blended"
+
+
+def test_material_far_from_the_question_is_not_offered_at_all():
+    """Below the offer floor there is no signal left, only a citation waiting
+    to be invented."""
+    noise = settings.ai_retrieval_min_score * 0.05
+    assert pipeline.route(_state([_passage(noise)])) == "general"
+    assert pipeline.route(_state([])) == "general"
+
+
+def test_offered_passages_reach_the_model():
+    """`blended` is a label on a prompt unless the passages are actually in it."""
+    state = _state([_passage(settings.ai_retrieval_min_score * 0.6)])
+    state.mode = "blended"
+    messages = pipeline.compose(state)
+
+    assert messages[0].content.endswith(prompts.BLENDED)
+    assert "Coffman" in messages[-1].content
+
+
+async def test_a_disclaimer_the_model_writes_anyway_is_stripped(client, fake_model):
+    """
+    The prompt forbids it. The model does it regardless, because "I could not
+    find that in the provided context" is the most rehearsed sentence in every
+    RAG corpus ever trained on. The last defence is the stream itself.
+    """
+    headers, user_id = await sign_in(client)
+    await _give_notes(client, user_id)
+    fake_model.reply = (
+        "I could not find anything about this in your material. "
+        "A deadlock is a cycle of processes each waiting on the next."
+    )
+
+    response = await client.post(
+        "/api/v1/tutor/ask",
+        json={"question": "Who wrote Things Fall Apart?"},
+        headers=headers,
+    )
+
+    frames = _frames(response.text)
+    answer = _text(frames)
+
+    assert answer == "A deadlock is a cycle of processes each waiting on the next."
+    assert next(payload for name, payload in frames if name == "done")["text"] == answer
+
+
+def test_an_honest_uncertainty_is_not_mistaken_for_a_disclaimer():
+    """
+    "I do not know" is worth reading and must survive. Only a sentence that
+    names their material is thrown away.
+    """
+    guard = OpenerGuard()
+    text = "I do not know. The syllabus decides which convention is used."
+    assert guard.feed(text) + guard.flush() == text
+
+
+def test_stripping_does_not_depend_on_how_the_stream_is_chunked():
+    text = (
+        "There is nothing in your notes about this. "
+        "Chinua Achebe published it in 1958."
+    )
+    want = "Chinua Achebe published it in 1958."
+
+    for size in (1, 3, 7, 40, len(text)):
+        guard = OpenerGuard()
+        out = "".join(guard.feed(text[i : i + size]) for i in range(0, len(text), size))
+        assert out + guard.flush() == want
 
 
 # --- Formatting ---------------------------------------------------------------
@@ -795,7 +896,6 @@ async def test_a_question_about_the_pdf_itself_is_answered_from_the_pdf(
     assert meta["mode"] == "grounded"
     assert meta["sources"], "the document it is describing has to be cited"
     assert "Coffman" in fake_model.user_prompt
-    assert prompts.NOT_IN_MATERIAL not in _text(frames)
 
 
 async def test_a_question_about_a_pdf_that_does_not_exist_is_not_faked(

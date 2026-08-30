@@ -1,6 +1,15 @@
 from fastapi import APIRouter
 
-from app.api.v1.routes import auth, billing, materials, me, settings, sync, tutor
+from app.api.v1.routes import (
+    auth,
+    billing,
+    feedback,
+    materials,
+    me,
+    settings,
+    sync,
+    tutor,
+)
 from app.api.v1.routes.admin import admin_router
 
 api_router = APIRouter()
@@ -9,6 +18,7 @@ api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
 api_router.include_router(me.router, prefix="/me", tags=["account"])
 # Mounted under /me because every one of these is a property of the account.
 api_router.include_router(settings.router, prefix="/me", tags=["account"])
+api_router.include_router(feedback.router, prefix="/me", tags=["account"])
 api_router.include_router(sync.router, prefix="/sync", tags=["sync"])
 api_router.include_router(materials.router, prefix="/materials", tags=["knowledge"])
 api_router.include_router(billing.router, prefix="/billing", tags=["billing"])

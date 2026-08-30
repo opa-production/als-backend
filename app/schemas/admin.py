@@ -441,6 +441,34 @@ class AdminMaterialRow(BaseModel):
     created_at: datetime
 
 
+# --- Feedback ----------------------------------------------------------------
+
+
+class AdminFeatureRequestRow(BaseModel):
+    """
+    One request, with just enough of the requester to judge it.
+
+    The name and institution are here because "three people at Kenyatta asked
+    for this" is the whole reason to read the table, and a column of bare user
+    ids cannot say that. The phone number is not: the console has a user page
+    for anyone who needs to reach someone, and a feedback list read by every
+    admin is the wrong place to spread contact details across.
+    """
+
+    id: uuid.UUID
+    user_id: uuid.UUID
+    body: str
+    app_version: str
+    platform: str
+    created_at: datetime
+    full_name: str
+    institution: str
+    #: What they are on now, not what they were on when they wrote it. Worth
+    #: having beside a request: paying students asking for the same thing is a
+    #: different signal from free ones asking for it.
+    tier: str
+
+
 # --- Ops ---------------------------------------------------------------------
 
 

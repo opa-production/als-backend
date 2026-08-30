@@ -158,20 +158,43 @@ async def get_entitlement(session: AsyncSession, user_id: uuid.UUID) -> Entitlem
             nominal_tier=Tier.FREE,
         )
 
+    return Entitlement(
+        tier=effective_tier(subscription),
+        expires_at=as_utc(subscription.expires_at),
+        verified=subscription.verified,
+        nominal_tier=plan_for(subscription.tier).id,
+    )
+
+
+def effective_tier(
+    subscription: Subscription | None, moment: datetime | None = None
+) -> Tier:
+    """
+    What a subscription row is actually worth right now.
+
+    Pulled out of ``get_entitlement`` so that a caller holding a row it already
+    joined -- a console list drawing a tier beside fifty rows -- can apply the
+    same rule without a query each. Two readings of "is this plan in force"
+    that drift apart is how a student sees Pro on an admin screen and hits a
+    Free limit in the app.
+    """
+    if subscription is None:
+        return Tier.FREE
+
     nominal = plan_for(subscription.tier).id
     expires = as_utc(subscription.expires_at)
+    now = moment or utc_now()
 
     # Free does not run out, so it is never lapsed. Anything else with no end
     # date is a row that was never finished, and that is not an entitlement.
-    lapsed = nominal is not Tier.FREE and (expires is None or expires <= utc_now())
-    unverified_paid = nominal not in (Tier.FREE, Tier.TRIAL) and not subscription.verified
-
-    return Entitlement(
-        tier=Tier.FREE if (lapsed or unverified_paid) else nominal,
-        expires_at=expires,
-        verified=subscription.verified,
-        nominal_tier=nominal,
+    lapsed = nominal is not Tier.FREE and (expires is None or expires <= now)
+    # An unverified paid row is a claim -- the app writes one the moment a
+    # student says they paid. Trial is exempt: nobody pays for one.
+    unverified_paid = (
+        nominal not in (Tier.FREE, Tier.TRIAL) and not subscription.verified
     )
+
+    return Tier.FREE if (lapsed or unverified_paid) else nominal
 
 
 # --- Counters ----------------------------------------------------------------

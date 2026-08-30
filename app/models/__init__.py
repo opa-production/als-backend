@@ -19,6 +19,7 @@ from app.models.billing import (
     UsageCounter,
 )
 from app.models.course import ClassSession, Unit
+from app.models.feedback import FeatureRequest
 from app.models.knowledge import Material, MaterialChunk
 from app.models.notification import NotificationLog
 from app.models.planner import Event
@@ -35,6 +36,7 @@ __all__ = [
     "Chat",
     "Device",
     "Event",
+    "FeatureRequest",
     "Material",
     "MaterialChunk",
     "Message",

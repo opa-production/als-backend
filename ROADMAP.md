@@ -87,6 +87,7 @@ type.
 | Payments | `GET /admin/payments`, `/payments/{id}`, `POST /payments/{reference}/reconcile` |
 | Groups | `GET /admin/groups`, `/groups/{id}` |
 | Content | `GET /admin/content/stats`, `/content/materials` |
+| Feedback | `GET /admin/feedback/feature-requests` — read-only; students file them at `POST /me/feature-requests` |
 | Ops | `GET /admin/ops/health`, `/ops/plans` |
 | Audit | `GET /admin/audit`, `/audit/actions` |
 | Admins | `GET|POST /admin/admins`, `PATCH|DELETE /admin/admins/{id}`, `GET /{id}/sessions` |

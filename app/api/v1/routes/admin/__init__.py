@@ -19,6 +19,7 @@ from app.api.v1.routes.admin import (
     audit,
     auth,
     content,
+    feedback,
     groups,
     ops,
     overview,
@@ -46,6 +47,9 @@ guarded.include_router(revenue.router, prefix="/revenue", tags=["admin: revenue"
 guarded.include_router(payments.router, prefix="/payments", tags=["admin: revenue"])
 guarded.include_router(groups.router, prefix="/groups", tags=["admin: groups"])
 guarded.include_router(content.router, prefix="/content", tags=["admin: content"])
+guarded.include_router(
+    feedback.router, prefix="/feedback", tags=["admin: feedback"]
+)
 guarded.include_router(ops.router, prefix="/ops", tags=["admin: ops"])
 guarded.include_router(audit.router, prefix="/audit", tags=["admin: audit"])
 guarded.include_router(admins.router, prefix="/admins", tags=["admin: admins"])

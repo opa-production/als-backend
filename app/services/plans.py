@@ -19,6 +19,13 @@ class Tier(StrEnum):
     STANDARD = "standard"
     PRO = "pro"
     FRIENDS = "friends"
+    #: The same three plans bought four months at a time. Separate tiers rather
+    #: than a flag, because a Kora charge has to say unambiguously what was
+    #: bought — and because `duration_days` already carries the difference, so
+    #: expiry, activation and the webhook need to know nothing new.
+    STANDARD_SEASON = "standard_season"
+    PRO_SEASON = "pro_season"
+    FRIENDS_SEASON = "friends_season"
     #: Legacy. The fourteen-day trial is no longer granted to anyone; this
     #: exists so the accounts still inside one finish the fortnight they were
     #: promised, and so old subscription rows still resolve to something. It
@@ -38,17 +45,25 @@ class Limits:
     total_pdf_pages_pool: int
     max_single_file_size_mb: int
     max_single_file_pages: int
-    daily_ai_queries: int
-    #: The most this tier will ever answer, across every day it is held.
+    #: Questions a month, not a day.
     #:
-    #: Only Free sets one. A daily limit alone bounds the rate and not the
-    #: bill: a free account that never converts costs five questions a day
+    #: Revision is not spread evenly across a month — it happens the night
+    #: before a CAT, in one long sitting. A daily ceiling refused a student at
+    #: precisely the moment the app mattered to them, and it was never what
+    #: bounded the bill: a month's allowance costs the same whether it is spent
+    #: in one night or across thirty. The monthly total is the ceiling that
+    #: does real work, so it is the only one left.
+    monthly_ai_queries: int
+    #: The most this tier will ever answer, across every month it is held.
+    #:
+    #: Only Free sets one. A monthly limit alone bounds the rate and not the
+    #: bill: a free account that never converts costs thirty questions a month
     #: for as long as it exists, and the point of the free plan is to show
     #: someone the product, not to be the product. UNLIMITED everywhere else,
-    #: where a paid month is what bounds it.
+    #: where a paid period is what bounds it.
     lifetime_ai_queries: int
     quiz_count: int
-    quiz_interval: str  # lifetime | weekly | unlimited
+    quiz_interval: str  # lifetime | monthly | unlimited
     quiz_max_questions: int
     timetable_mode: str  # manual | alerts | ai_sync
     source_citations: str  # basic | exact_page | deep_summary
@@ -65,6 +80,27 @@ class Plan:
     seats: int
     limits: Limits
 
+    #: Which card this plan appears on: "focus", "synapse", "friends". A plan
+    #: and its Season are the same card with the toggle flipped, and this is
+    #: what pairs them. Stated rather than parsed out of the id, because an id
+    #: is a key and the day someone adds "pro_annual" a prefix rule quietly
+    #: puts it on the wrong card.
+    family: str = ""
+    #: "monthly" | "season"
+    billing_period: str = "monthly"
+
+    @property
+    def price_per_month_ksh(self) -> int:
+        """
+        What it works out at a month.
+
+        Derived here rather than in the app so the figure under the price and
+        the figure being charged cannot disagree — the same reason
+        ``price_per_seat_ksh`` is derived.
+        """
+        months = max(1, round(self.duration_days / MONTH_DAYS))
+        return self.price_ksh // months
+
     @property
     def price_per_seat_ksh(self) -> int:
         """
@@ -77,12 +113,38 @@ class Plan:
         return self.price_ksh // max(1, self.seats)
 
 
+#: A month, for turning a plan's length into a per-month price. Thirty days:
+#: the monthly plans are sold as 30, so a Season priced against anything else
+#: would report a saving that is partly an artefact of the calendar.
+MONTH_DAYS = 30
+
+#: How long a Season runs. Four months, which is a semester in every calendar
+#: that matters here without being called one.
+SEASON_DAYS = 120
+
+
+_FOCUS_LIMITS = Limits(
+    max_course_units=4,
+    total_pdf_pages_pool=400,
+    max_single_file_size_mb=25,
+    max_single_file_pages=100,
+    monthly_ai_queries=400,
+    lifetime_ai_queries=UNLIMITED,
+    quiz_count=20,
+    quiz_interval="monthly",
+    quiz_max_questions=10,
+    timetable_mode="alerts",
+    source_citations="exact_page",
+    allow_ocr_scans=False,
+    monthly_ocr_page_limit=0,
+)
+
 _PRO_LIMITS = Limits(
     max_course_units=10,
     total_pdf_pages_pool=1500,
     max_single_file_size_mb=50,
     max_single_file_pages=300,
-    daily_ai_queries=120,
+    monthly_ai_queries=1200,
     lifetime_ai_queries=UNLIMITED,
     quiz_count=UNLIMITED,
     quiz_interval="unlimited",
@@ -116,6 +178,7 @@ PLANS: dict[Tier, Plan] = {
     Tier.FREE: Plan(
         id=Tier.FREE,
         name="Free",
+        family="free",
         price_ksh=0,
         # It does not run out. `get_entitlement` never expires this tier, and
         # zero here says so rather than meaning "already over".
@@ -126,15 +189,22 @@ PLANS: dict[Tier, Plan] = {
             # not enough to carry a semester. The cap only ever refuses a
             # *new* unit, so a student who paid, lapsed and has four keeps
             # seeing all four.
-            max_course_units=1,
+            # Two, not one. A student takes five or six units a semester, and
+            # a single slot does not let them file even a simplified version
+            # of their own week — which reads as "this app is not for me"
+            # rather than as a limit worth paying to lift.
+            max_course_units=2,
             total_pdf_pages_pool=100,
             max_single_file_size_mb=10,
             # The whole pool in one document, so a single 100-page lecture PDF
             # is uploadable rather than being refused for being one file.
             max_single_file_pages=100,
-            daily_ai_queries=5,
+            monthly_ai_queries=30,
             # About three weeks of using it properly, or one very long night.
             # Either way, enough to have found out whether it helps.
+            #
+            # This is the number that actually bounds what a free account can
+            # cost. The monthly one only shapes how fast it is reached.
             lifetime_ai_queries=100,
             # One, ever. None at all would hide the feature that most obviously
             # justifies paying for the thing.
@@ -153,6 +223,7 @@ PLANS: dict[Tier, Plan] = {
     Tier.TRIAL: Plan(
         id=Tier.TRIAL,
         name="14-Day Free Trial",
+        family="free",
         price_ksh=0,
         duration_days=14,
         seats=1,
@@ -161,7 +232,7 @@ PLANS: dict[Tier, Plan] = {
             total_pdf_pages_pool=100,
             max_single_file_size_mb=10,
             max_single_file_pages=30,
-            daily_ai_queries=15,
+            monthly_ai_queries=450,
             # The fortnight is the ceiling on a trial. It ends on its own.
             lifetime_ai_queries=UNLIMITED,
             quiz_count=2,
@@ -176,28 +247,16 @@ PLANS: dict[Tier, Plan] = {
     Tier.STANDARD: Plan(
         id=Tier.STANDARD,
         name="Focus",
+        family="focus",
         price_ksh=150,
         duration_days=30,
         seats=1,
-        limits=Limits(
-            max_course_units=4,
-            total_pdf_pages_pool=400,
-            max_single_file_size_mb=25,
-            max_single_file_pages=100,
-            daily_ai_queries=40,
-            lifetime_ai_queries=UNLIMITED,
-            quiz_count=5,
-            quiz_interval="weekly",
-            quiz_max_questions=10,
-            timetable_mode="alerts",
-            source_citations="exact_page",
-            allow_ocr_scans=False,
-            monthly_ocr_page_limit=0,
-        ),
+        limits=_FOCUS_LIMITS,
     ),
     Tier.PRO: Plan(
         id=Tier.PRO,
         name="Synapse",
+        family="synapse",
         price_ksh=350,
         duration_days=30,
         seats=1,
@@ -208,12 +267,58 @@ PLANS: dict[Tier, Plan] = {
     Tier.FRIENDS: Plan(
         id=Tier.FRIENDS,
         name="Friends",
-        # KES 250 each for five. Below Synapse's 350 per head, which is the
+        family="friends",
+        # KES 208 each for six. Below Synapse's 350 per head, which is the
         # whole proposition, and above Focus so it never undercuts the plan a
         # single student would otherwise buy.
+        #
+        # Six rather than five: a study table is six, the price did not have to
+        # move to get there, and "one seat left" is a much easier thing to say
+        # to a sixth friend than "sorry, we are full".
         price_ksh=1250,
         duration_days=30,
-        seats=5,
+        seats=6,
+        limits=_PRO_LIMITS,
+    ),
+    # --- Seasons ---------------------------------------------------------
+    #
+    # Four months, because a student budgets the way their fees are billed and
+    # not the way a SaaS bills. It is also cheaper to collect: every KES 150
+    # charge pays a transaction fee with a fixed part in it, so one payment of
+    # 500 keeps more of itself than four of 150.
+    #
+    # A Season buys *time*, not a bigger allowance. The limits are the monthly
+    # plan's own object, so the refill is the same 400 or 1,200 a month, four
+    # times over — and a number changed on Focus cannot drift away from Focus
+    # Season.
+    Tier.STANDARD_SEASON: Plan(
+        id=Tier.STANDARD_SEASON,
+        name="Focus Season",
+        family="focus",
+        billing_period="season",
+        price_ksh=500,
+        duration_days=SEASON_DAYS,
+        seats=1,
+        limits=_FOCUS_LIMITS,
+    ),
+    Tier.PRO_SEASON: Plan(
+        id=Tier.PRO_SEASON,
+        name="Synapse Season",
+        family="synapse",
+        billing_period="season",
+        price_ksh=1100,
+        duration_days=SEASON_DAYS,
+        seats=1,
+        limits=_PRO_LIMITS,
+    ),
+    Tier.FRIENDS_SEASON: Plan(
+        id=Tier.FRIENDS_SEASON,
+        name="Friends Season",
+        family="friends",
+        billing_period="season",
+        price_ksh=4200,
+        duration_days=SEASON_DAYS,
+        seats=6,
         limits=_PRO_LIMITS,
     ),
 }
@@ -234,7 +339,51 @@ def plan_for(tier: str | Tier) -> Plan:
 #: Free is not among them. There is nothing to buy and no trial to start — a
 #: new account simply has it, which is what removed the whole "has this number
 #: had a trial" question from the product.
-SELLABLE = (Tier.STANDARD, Tier.PRO, Tier.FRIENDS)
+SELLABLE = (
+    Tier.STANDARD,
+    Tier.PRO,
+    Tier.FRIENDS,
+    Tier.STANDARD_SEASON,
+    Tier.PRO_SEASON,
+    Tier.FRIENDS_SEASON,
+)
+
+
+def monthly_counterpart(plan: Plan) -> Plan | None:
+    """
+    The 30-day plan a Season is the long version of.
+
+    Found by family rather than by a hand-written pairing table: a table is a
+    second place to remember, and the one thing a new plan is guaranteed to
+    have is a family.
+    """
+    if plan.billing_period == "monthly":
+        return None
+
+    return next(
+        (
+            other
+            for other in PLANS.values()
+            if other.family == plan.family and other.billing_period == "monthly"
+        ),
+        None,
+    )
+
+
+def saving_percent(plan: Plan) -> int:
+    """
+    How much cheaper a month is on this plan than on the monthly one.
+
+    Zero for a monthly plan, which is what the badge on the toggle reads as
+    "no badge". Computed from the two prices rather than written down, because
+    a saving that is typed in is a saving that survives a price change and
+    starts lying.
+    """
+    monthly = monthly_counterpart(plan)
+    if monthly is None or monthly.price_ksh <= 0:
+        return 0
+
+    return round(100 * (1 - plan.price_per_month_ksh / monthly.price_ksh))
 
 
 def limits_for(tier: str | Tier) -> Limits:

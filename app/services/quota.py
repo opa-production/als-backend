@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import func, select
@@ -49,10 +49,10 @@ class Entitlement:
 # --- Periods -----------------------------------------------------------------
 #
 # Every boundary here is cut on the student's own clock, not on UTC. Cut on
-# UTC, a daily allowance comes back at 3am in Nairobi: someone who runs out at
-# nine in the evening is told to come back tomorrow, opens the app at one in
-# the morning, and finds nothing has changed. "Tomorrow" has to mean the
-# moment their phone says midnight, so the zone travels with the period key.
+# UTC, a month turns over at 3am in Nairobi: someone who runs out on the last
+# night of the month opens the app after midnight, sees the 1st on their phone
+# and finds nothing has refilled. The 1st has to mean their 1st, so the zone
+# travels with the period key.
 
 UTC_ZONE = ZoneInfo("UTC")
 
@@ -93,34 +93,52 @@ def _local(moment: datetime | None, zone: ZoneInfo | None) -> datetime:
     return (moment or utc_now()).astimezone(zone or zone_for(None))
 
 
-def day_key(moment: datetime | None = None, zone: ZoneInfo | None = None) -> str:
-    return _local(moment, zone).strftime("%Y-%m-%d")
-
-
-def week_key(moment: datetime | None = None, zone: ZoneInfo | None = None) -> str:
-    """
-    ISO week, Monday-first, matching the client's own week boundary.
-
-    If the two disagreed, a student would see five quizzes left on the phone
-    and be refused by the server, which reads as a bug rather than a limit.
-    """
-    return _local(moment, zone).strftime("%G-W%V")
-
-
 def month_key(moment: datetime | None = None, zone: ZoneInfo | None = None) -> str:
     return _local(moment, zone).strftime("%Y-%m")
 
 
+def _lifetime(moment: datetime | None = None, zone: ZoneInfo | None = None) -> str:
+    return "lifetime"
+
+
 #: Which period each metered thing rolls over on. Every entry takes the same
 #: ``(moment, zone)`` shape so callers never have to know which ones care.
+#:
+#: There used to be a day key and a week key here as well. They are gone, and
+#: the reason is in ``plans.py``: revision happens in one long night before a
+#: CAT, so a daily ceiling refused students at the only moment the app mattered
+#: — while bounding nothing a monthly ceiling does not bound already. Every
+#: meter now rolls over together, which also makes the product one sentence:
+#: everything refills on the 1st.
 METRIC_PERIODS = {
-    "ai_queries": day_key,
-    "ai_queries_lifetime": lambda moment=None, zone=None: "lifetime",
-    "quizzes_weekly": week_key,
-    "quizzes_lifetime": lambda moment=None, zone=None: "lifetime",
+    "ai_queries": month_key,
+    "ai_queries_lifetime": _lifetime,
+    "quizzes_monthly": month_key,
+    "quizzes_lifetime": _lifetime,
     "ocr_pages": month_key,
-    "pdf_pages": lambda moment=None, zone=None: "lifetime",
+    "pdf_pages": _lifetime,
 }
+
+
+def resets_on(
+    metric: str, zone: ZoneInfo | None = None, moment: datetime | None = None
+) -> date | None:
+    """
+    The day this meter next refills, or ``None`` if it never does.
+
+    Sent to the app so it can say "refills in 6 days" without doing calendar
+    arithmetic — the kind that is right for eleven months and wrong in
+    December. A lifetime counter returns ``None``, and the app must say
+    something else entirely there: a ceiling that is never coming back is not a
+    reset to count down to.
+    """
+    if METRIC_PERIODS[metric] is _lifetime:
+        return None
+
+    local = _local(moment, zone).date()
+    # The first of next month. Day 28 plus four days lands in the next month
+    # from any month length, including February in a leap year.
+    return (local.replace(day=28) + timedelta(days=4)).replace(day=1)
 
 
 # --- Entitlement -------------------------------------------------------------
@@ -326,9 +344,9 @@ async def check_ai_query(
     """
     Two ceilings, and they mean different things to the person who hits them.
 
-    The daily one is a rate: come back tomorrow. The lifetime one is the end of
-    the free plan, and the message has to say so — telling someone to wait for
-    a reset that is never coming is worse than telling them the truth.
+    The monthly one is a rate: it refills on the 1st. The lifetime one is the
+    end of the free plan, and the message has to say so — telling someone to
+    wait for a reset that is never coming is worse than telling them the truth.
     """
     limits = entitlement.limits
     zone = await user_zone(session, user_id)
@@ -341,13 +359,16 @@ async def check_ai_query(
                 "free plan includes. A paid plan carries on from here."
             )
 
-    limit = limits.daily_ai_queries
+    limit = limits.monthly_ai_queries
     if limit == UNLIMITED:
         return
 
     used = await current_usage(session, user_id, "ai_queries", zone)
     if used >= limit:
-        raise QuotaExceeded(f"You have used today's {limit} AI questions.")
+        raise QuotaExceeded(
+            f"You have used this month's {limit} AI questions. "
+            "They refill on the 1st."
+        )
 
 
 async def record_ai_query(session: AsyncSession, user_id: uuid.UUID) -> None:
@@ -374,18 +395,28 @@ async def check_quiz(
     if limits.quiz_count == UNLIMITED or limits.quiz_interval == "unlimited":
         return
 
-    metric = (
-        "quizzes_weekly" if limits.quiz_interval == "weekly" else "quizzes_lifetime"
-    )
+    metric = quiz_metric(limits)
     used = await current_usage(session, user_id, metric)
 
     if used >= limits.quiz_count:
         raise QuotaExceeded(
-            f"You have used this week's {limits.quiz_count} quizzes."
-            if limits.quiz_interval == "weekly"
+            f"You have used this month's {limits.quiz_count} quizzes. "
+            "They refill on the 1st."
+            if limits.quiz_interval == "monthly"
             else f"{plan_for(entitlement.tier).name} includes "
             f"{limits.quiz_count} quizzes in total."
         )
+
+
+def quiz_metric(limits) -> str:
+    """
+    Which counter a quiz is spent against.
+
+    In one place because three callers need the answer — the check, the spend,
+    and the usage screen — and two of them disagreeing means a student is shown
+    an allowance they are not refused against.
+    """
+    return "quizzes_monthly" if limits.quiz_interval == "monthly" else "quizzes_lifetime"
 
 
 def check_file_size(entitlement: Entitlement, byte_size: int | None) -> None:

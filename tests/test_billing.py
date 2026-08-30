@@ -9,6 +9,7 @@ charge someone twice.
 import hashlib
 import hmac
 import json
+from datetime import datetime
 
 import httpx
 import pytest
@@ -19,7 +20,7 @@ from app.core.config import settings
 from app.main import app
 from app.services.billing import activate, tier_from_charge
 from app.services.kora import Charge, to_shillings, verify_signature
-from app.services.plans import Tier, plan_for
+from app.services.plans import Tier, plan_for, saving_percent
 from tests.conftest import OTHER_PHONE, sign_in
 
 SECRET = "test-webhook-secret"
@@ -177,16 +178,28 @@ def test_the_amount_resolves_the_tier_without_metadata():
 
 def test_paying_between_two_plans_gets_the_lower_one():
     """
-    KES 1000 is more than Synapse and less than Friends. It buys Synapse —
-    resolving upward would hand out five seats for four seats' money.
+    KES 1,000 is more than a Focus Season and less than a Synapse Season. It
+    buys the Focus Season — resolving upward would hand out four months of
+    Synapse for the price of four months of Focus.
     """
-    assert tier_from_charge(_charge(1000)) is Tier.PRO
+    assert tier_from_charge(_charge(1000)) is Tier.STANDARD_SEASON
+
+
+def test_a_season_price_resolves_to_the_season():
+    """
+    The amounts have to stay distinguishable as plans are added. KES 1,250 is a
+    Friends month rather than a Synapse Season, because it is worth more.
+    """
+    assert tier_from_charge(_charge(500)) is Tier.STANDARD_SEASON
+    assert tier_from_charge(_charge(1100)) is Tier.PRO_SEASON
+    assert tier_from_charge(_charge(1250)) is Tier.FRIENDS
+    assert tier_from_charge(_charge(4200)) is Tier.FRIENDS_SEASON
 
 
 def test_friends_is_cheaper_per_head_than_synapse_alone():
     """The entire proposition. If this ever inverts, the plan is pointless."""
     friends = plan_for(Tier.FRIENDS)
-    assert friends.price_per_seat_ksh == 250
+    assert friends.price_per_seat_ksh == 208
     assert friends.price_per_seat_ksh < plan_for(Tier.PRO).price_ksh
 
 
@@ -215,6 +228,126 @@ async def test_renewing_extends_rather_than_restarts(client):
 
     days = plan_for(Tier.PRO).duration_days
     assert (second.expires_at - first_end).days == pytest.approx(days, abs=1)
+
+
+async def test_a_season_runs_for_four_months(client):
+    """
+    What a Season buys is time. If this ever comes back thirty days, the plan
+    has silently become an expensive Focus.
+    """
+    _, user_id = await sign_in(client)
+
+    async with client.sessions() as session:
+        subscription = await activate(
+            session, user_id=user_id, tier=Tier.STANDARD_SEASON, verified=True
+        )
+        await session.commit()
+
+    assert (subscription.expires_at - utc_now()).days == pytest.approx(120, abs=1)
+
+
+async def test_a_season_buys_time_and_not_a_bigger_allowance(client):
+    """
+    Four months of Focus, not four months' questions in one lump.
+
+    Worth asserting because the opposite is the intuitive reading of the price,
+    and a student who believes it feels cheated in week three.
+    """
+    monthly = plan_for(Tier.STANDARD).limits
+    season = plan_for(Tier.STANDARD_SEASON).limits
+
+    assert season.monthly_ai_queries == monthly.monthly_ai_queries
+    assert season is monthly  # The same object, so the two cannot drift.
+
+
+def test_a_season_is_cheaper_per_month_than_paying_monthly():
+    """The only reason to buy one."""
+    for season, monthly in (
+        (Tier.STANDARD_SEASON, Tier.STANDARD),
+        (Tier.PRO_SEASON, Tier.PRO),
+        (Tier.FRIENDS_SEASON, Tier.FRIENDS),
+    ):
+        assert (
+            plan_for(season).price_per_month_ksh < plan_for(monthly).price_ksh
+        ), season
+        assert saving_percent(plan_for(season)) > 0
+        # A monthly plan is the baseline, so it never wears a saving badge.
+        assert saving_percent(plan_for(monthly)) == 0
+
+
+async def test_the_plans_payload_pairs_each_card(client):
+    """
+    The toggle swaps a price in place, so the app has to know which two entries
+    are one card. It pairs on `family` -- never by picking apart an id.
+    """
+    body = (await client.get("/api/v1/billing/plans")).json()
+
+    by_family: dict[str, set[str]] = {}
+    for plan in body:
+        by_family.setdefault(plan["family"], set()).add(plan["billing_period"])
+
+    assert by_family == {
+        "focus": {"monthly", "season"},
+        "synapse": {"monthly", "season"},
+        "friends": {"monthly", "season"},
+    }
+
+    season = next(p for p in body if p["id"] == "pro_season")
+    assert season["price_ksh"] == 1100
+    # The line under the price, and the badge -- both computed here so they
+    # cannot disagree with what is actually charged.
+    assert season["price_per_month_ksh"] == 275
+    assert season["saving_percent"] == 21
+    assert season["duration_days"] == 120
+
+
+async def test_a_friends_season_group_lasts_as_long_as_the_plan(client):
+    """
+    A Season's group living thirty days would end the plan three months early
+    for everyone sitting in it.
+    """
+    headers, user_id = await sign_in(client)
+
+    async with client.sessions() as session:
+        await activate(
+            session, user_id=user_id, tier=Tier.FRIENDS_SEASON, verified=True
+        )
+        await session.commit()
+
+    group = (await client.post("/api/v1/billing/group", headers=headers)).json()
+
+    assert group["seats"] == 6
+    expires = datetime.fromisoformat(group["expires_at"])
+    assert (expires - utc_now()).days == pytest.approx(120, abs=1)
+
+
+async def test_a_seat_on_a_season_reports_the_season(client):
+    """A member's plan name has to be the one they are actually sitting on."""
+    owner_headers, owner_id = await sign_in(client)
+
+    async with client.sessions() as session:
+        await activate(
+            session, user_id=owner_id, tier=Tier.FRIENDS_SEASON, verified=True
+        )
+        await session.commit()
+
+    group = (
+        await client.post("/api/v1/billing/group", headers=owner_headers)
+    ).json()
+
+    friend_headers, _ = await sign_in(client, phone=OTHER_PHONE)
+    await client.post(
+        "/api/v1/billing/group/join",
+        json={"code": group["invite_code"]},
+        headers=friend_headers,
+    )
+
+    subscription = (
+        await client.get("/api/v1/billing/subscription", headers=friend_headers)
+    ).json()
+
+    assert subscription["tier"] == "friends_season"
+    assert subscription["name"] == "Friends Season"
 
 
 async def test_switching_tier_starts_a_fresh_period(client):
@@ -271,14 +404,21 @@ async def test_only_sellable_plans_are_advertised(client):
     body = (await client.get("/api/v1/billing/plans")).json()
 
     ids = {plan["id"] for plan in body}
-    assert ids == {"standard", "pro", "friends"}
+    assert ids == {
+        "standard",
+        "pro",
+        "friends",
+        "standard_season",
+        "pro_season",
+        "friends_season",
+    }
     # Neither the free plan nor the legacy trial is a product.
     assert "trial" not in ids
     assert "free" not in ids
 
     friends = next(p for p in body if p["id"] == "friends")
-    assert friends["seats"] == 5
-    assert friends["price_per_seat_ksh"] == 250
+    assert friends["seats"] == 6
+    assert friends["price_per_seat_ksh"] == 208
 
 
 # --- Checkout -----------------------------------------------------------------
@@ -468,11 +608,11 @@ async def _friends_owner(client):
     return headers, user_id
 
 
-async def test_the_owner_holds_one_of_the_five_seats(client):
+async def test_the_owner_holds_one_of_the_six_seats(client):
     headers, _ = await _friends_owner(client)
 
     group = (await client.post("/api/v1/billing/group", headers=headers)).json()
-    assert group["seats"] == 5
+    assert group["seats"] == 6
     assert group["seats_taken"] == 1
 
 
@@ -607,6 +747,32 @@ async def test_checkout_leaves_a_pending_payment_to_find(client, kora):
     assert payment.user_id == user_id
     assert payment.amount_kes == plan_for(Tier.PRO).price_ksh
     assert payment.paid_at is None
+
+
+async def test_paying_for_a_friends_season_opens_the_group(client, kora):
+    """
+    The trailing step, on the tier most likely to be forgotten.
+
+    Activation and group creation are two things, and every payment path has to
+    do both. A Friends Season that activates without a group is six seats with
+    no invite code to reach them by — the student paid KES 4,200 and has
+    nothing to share.
+    """
+    headers, _ = await sign_in(client)
+
+    started = await client.post(
+        "/api/v1/billing/checkout", json={"tier": "friends_season"}, headers=headers
+    )
+    reference = started.json()["reference"]
+
+    verified = await client.post(
+        "/api/v1/billing/verify", json={"reference": reference}, headers=headers
+    )
+    assert verified.status_code == 200, verified.text
+
+    group = await client.get("/api/v1/billing/group", headers=headers)
+    assert group.status_code == 200, "the group was never created"
+    assert group.json()["seats"] == 6
 
 
 async def test_confirming_a_pending_payment_activates_the_plan(client, kora):

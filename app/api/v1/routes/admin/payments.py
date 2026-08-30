@@ -14,7 +14,7 @@ from app.schemas.admin import ActionResult, AdminPaymentRow, Page
 from app.services import audit as audit_service
 from app.services import billing as billing_service
 from app.services.kora import verify_transaction
-from app.services.plans import Tier
+from app.services.plans import plan_for
 
 router = APIRouter()
 
@@ -204,9 +204,13 @@ async def reconcile(
         )
         # Same trailing step the verify and webhook paths take. Without it a
         # reconciled Friends payment activates the payer and never creates the
-        # group, so the four seats they bought have no invite code to reach.
-        if tier is Tier.FRIENDS:
-            await billing_service.create_group(session, owner_id=user.id)
+        # group, so the seats they bought have no invite code to reach. Keyed
+        # on the seat count rather than on one tier, so a Season is not the
+        # exception nobody remembered.
+        if plan_for(tier).seats > 1:
+            await billing_service.create_group(
+                session, owner_id=user.id, tier=tier
+            )
         activated = True
 
     await session.flush()

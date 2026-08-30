@@ -167,11 +167,15 @@ class UsageCounter(Base, UUIDPrimaryKey, Timestamps):
 
     #: ai_queries | quizzes | ocr_pages | pdf_pages
     metric: Mapped[str] = mapped_column(String(24), nullable=False)
-    #: "2026-08-23" | "2026-W34" | "2026-08" | "lifetime"
+    #: "2026-08" | "lifetime". Day and ISO-week keys were written here until
+    #: allowances moved onto a monthly clock; rows carrying them are simply
+    #: never read again, which is why nothing had to be migrated.
     period_key: Mapped[str] = mapped_column(String(16), nullable=False)
 
     count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    #: Kept for the daily reset sweep and for cheap "used today" reads.
+    #: The local day the row was opened on. Kept for cheap "what did they spend
+    #: this week" reads in the console, which the period key can no longer
+    #: answer now that it names a month.
     period_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     __table_args__ = (

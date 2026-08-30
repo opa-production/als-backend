@@ -197,12 +197,16 @@ async def test_overview_shape(client):
     assert body["users"]["total"] == 1
     assert body["revenue"]["currency"] == "KES"
     assert body["revenue"]["gross_ksh"] == 0
-    # Trial plus the three sellable plans.
+    # Trial plus every sellable plan — each of the three families monthly and
+    # as a Season.
     assert {row["tier"] for row in body["plans"]} == {
         "trial",
         "standard",
         "pro",
         "friends",
+        "standard_season",
+        "pro_season",
+        "friends_season",
     }
     assert body["funnel"]["signed_up"] == 1
 
@@ -359,7 +363,7 @@ async def test_user_search_and_detail(client, paid_student):
     assert detailed["effective_tier"] == "pro"
     assert detailed["total_paid_ksh"] == 350
     assert len(detailed["payments"]) == 1
-    assert "daily_ai_queries" in detailed["limits"]
+    assert "monthly_ai_queries" in detailed["limits"]
 
 
 async def test_detail_shows_when_entitlement_disagrees_with_the_row(client):
@@ -561,8 +565,8 @@ async def test_ops_plans_is_the_server_side_catalogue(client):
 
     plans = {row["id"]: row for row in response.json()}
     assert plans["pro"]["price_ksh"] == 350
-    assert plans["friends"]["price_per_seat_ksh"] == 250
-    assert plans["free"]["limits"]["daily_ai_queries"] == 5
+    assert plans["friends"]["price_per_seat_ksh"] == 208
+    assert plans["free"]["limits"]["monthly_ai_queries"] == 30
 
 
 # --- Audit -------------------------------------------------------------------

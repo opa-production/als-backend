@@ -348,7 +348,7 @@ async def test_a_failed_build_does_not_spend_the_allowance(client, fake):
     """
     Charged after the build, unlike an answer.
 
-    A weekly quiz allowance is small enough that spending one on a provider
+    A monthly quiz allowance is small enough that spending one on a provider
     outage is a real loss to the student, and the race it opens is one quiz
     wide.
     """

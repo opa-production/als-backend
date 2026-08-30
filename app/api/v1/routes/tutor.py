@@ -39,6 +39,7 @@ from app.services.quota import (
     check_ai_query,
     check_quiz,
     get_entitlement,
+    quiz_metric,
     record_ai_query,
     record_usage,
 )
@@ -287,7 +288,7 @@ async def ask(
 
     The quota is charged **before** generating, not after. Charging afterwards
     means a student who disconnects halfway has asked for free, and that is the
-    cheapest possible way to bypass a daily limit.
+    cheapest possible way to bypass an allowance.
     """
     entitlement = await get_entitlement(session, user.id)
     await check_ai_query(session, user.id, entitlement)
@@ -484,9 +485,9 @@ async def build_quiz(
     unvalidated quiz can tell a student they are wrong when the question was
     broken.
 
-    Metered against the plan's quiz allowance, which is weekly on Focus and
-    lifetime on the trial. Charged before generating, for the same reason
-    `/ask` is: a client that disconnects halfway would otherwise quiz for free.
+    Metered against the plan's quiz allowance, which is monthly on Focus and
+    lifetime on Free. Charged before generating, for the same reason `/ask`
+    is: a client that disconnects halfway would otherwise quiz for free.
     """
     entitlement = await get_entitlement(session, user.id)
     await check_quiz(session, user.id, entitlement)
@@ -506,16 +507,11 @@ async def build_quiz(
         model_id=payload.model,
     )
 
-    # After the build, so a provider failure does not spend a weekly allowance
-    # the student got nothing for. The window in which two concurrent requests
+    # After the build, so a provider failure does not spend an allowance the
+    # student got nothing for. The window in which two concurrent requests
     # could both pass the check is one quiz wide, which is a cheaper problem
     # than charging for failures.
-    metric = (
-        "quizzes_weekly"
-        if entitlement.limits.quiz_interval == "weekly"
-        else "quizzes_lifetime"
-    )
-    await record_usage(session, user.id, metric)
+    await record_usage(session, user.id, quiz_metric(entitlement.limits))
     await session.commit()
 
     return QuizOut(

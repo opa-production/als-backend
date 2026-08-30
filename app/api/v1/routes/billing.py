@@ -21,7 +21,7 @@ from app.services.kora import (
     verify_signature,
     verify_transaction,
 )
-from app.services.plans import PLANS, SELLABLE, Tier, plan_for
+from app.services.plans import PLANS, SELLABLE, Tier, plan_for, saving_percent
 from app.services.quota import get_entitlement
 
 log = structlog.get_logger()
@@ -31,9 +31,20 @@ router = APIRouter()
 class PlanOut(BaseModel):
     id: str
     name: str
+    #: Which card this plan belongs on: "focus", "synapse", "friends". A plan
+    #: and its Season are one card with the toggle flipped, and this is what
+    #: pairs them — the app must not pair them by picking apart the id.
+    family: str
+    #: "monthly" | "season"
+    billing_period: str
     price_ksh: int
     #: Derived, so the total and the per-head figure cannot drift apart.
     price_per_seat_ksh: int
+    #: What a Season works out at a month, for the line under the price.
+    price_per_month_ksh: int
+    #: How much cheaper that is than the monthly plan on the same card. Zero on
+    #: the monthly plans themselves, which the app reads as "no badge".
+    saving_percent: int
     duration_days: int
     seats: int
 
@@ -103,20 +114,31 @@ async def list_plans() -> list[PlanOut]:
 
     The app ships its own copy so it works offline; this endpoint is what lets
     a price change reach a phone without an app store release.
+
+    Six entries: three plans, each monthly and as a Season. They arrive
+    together in one call so the pricing toggle swaps a number in place instead
+    of going back to the network for a screen the student is already looking
+    at. A build that predates the toggle ignores `family` and
+    `billing_period`, draws the three monthly plans it recognises, and is
+    simply an older, correct screen.
     """
     # Driven by SELLABLE rather than by excluding tiers one at a time. The
     # exclusion list was "not trial", which silently started advertising the
     # expired tier the moment one existed.
     return [
         PlanOut(
-            id=PLANS[tier].id.value,
-            name=PLANS[tier].name,
-            price_ksh=PLANS[tier].price_ksh,
-            price_per_seat_ksh=PLANS[tier].price_per_seat_ksh,
-            duration_days=PLANS[tier].duration_days,
-            seats=PLANS[tier].seats,
+            id=plan.id.value,
+            name=plan.name,
+            family=plan.family,
+            billing_period=plan.billing_period,
+            price_ksh=plan.price_ksh,
+            price_per_seat_ksh=plan.price_per_seat_ksh,
+            price_per_month_ksh=plan.price_per_month_ksh,
+            saving_percent=saving_percent(plan),
+            duration_days=plan.duration_days,
+            seats=plan.seats,
         )
-        for tier in SELLABLE
+        for plan in (PLANS[tier] for tier in SELLABLE)
     ]
 
 
@@ -288,8 +310,10 @@ async def verify_payment(
         await billing_service.activate(
             session, user_id=user.id, tier=tier, verified=True
         )
-        if tier is Tier.FRIENDS:
-            await billing_service.create_group(session, owner_id=user.id)
+        if plan_for(tier).seats > 1:
+            await billing_service.create_group(
+                session, owner_id=user.id, tier=tier
+            )
 
     return await read_subscription(user, session)
 
@@ -367,8 +391,10 @@ async def kora_webhook(
 
     if is_new and charge.status == SUCCESS:
         await billing_service.activate(session, user_id=owner, tier=tier, verified=True)
-        if tier is Tier.FRIENDS:
-            await billing_service.create_group(session, owner_id=owner)
+        if plan_for(tier).seats > 1:
+            await billing_service.create_group(
+                session, owner_id=owner, tier=tier
+            )
 
     log.info(
         "kora_webhook_applied",
@@ -396,14 +422,19 @@ async def create_group(user: CurrentUser, session: DbSession) -> GroupOut:
     """
     Opens the group and seats you in it.
 
-    Only for an account already on Friends — a group without a payment behind
-    it is five free Synapse seats.
+    Only for an account already on a plan that has seats to give — a group
+    without a payment behind it is six free Synapse seats. The test is the
+    plan's own seat count rather than a named tier, so Friends Season works
+    here the day it is added and nothing has to remember to list it.
     """
     entitlement = await get_entitlement(session, user.id)
-    if entitlement.tier is not Tier.FRIENDS:
+    plan = plan_for(entitlement.tier)
+    if plan.seats <= 1:
         raise Forbidden("A Friends plan is needed before you can invite anyone.")
 
-    group = await billing_service.create_group(session, owner_id=user.id)
+    group = await billing_service.create_group(
+        session, owner_id=user.id, tier=entitlement.tier
+    )
     return GroupOut(
         id=group.id,
         invite_code=group.invite_code,

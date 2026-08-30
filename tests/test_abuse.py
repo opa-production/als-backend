@@ -7,7 +7,7 @@ not just what the assertion is.
 """
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
@@ -69,8 +69,8 @@ async def test_deleting_and_signing_back_in_gains_nothing(client):
 
 async def test_free_is_a_demonstration_not_a_product(client):
     """
-    One unit and five questions a day. Enough to see whether the tutor answers
-    from your own notes; not enough to revise a semester on.
+    Two units and thirty questions a month. Enough to see whether the tutor
+    answers from your own notes; not enough to revise a semester on.
     """
     _, user_id = await sign_in(client)
 
@@ -78,19 +78,19 @@ async def test_free_is_a_demonstration_not_a_product(client):
         entitlement = await get_entitlement(session, user_id)
 
     assert entitlement.tier is Tier.FREE
-    assert entitlement.limits.max_course_units == 1
-    assert entitlement.limits.daily_ai_queries == 5
+    assert entitlement.limits.max_course_units == 2
+    assert entitlement.limits.monthly_ai_queries == 30
     assert entitlement.limits.total_pdf_pages_pool == 100
 
 
-async def test_the_free_daily_allowance_actually_refuses(client):
+async def test_the_free_monthly_allowance_actually_refuses(client):
     """A limit that is advertised and not enforced is not a limit."""
     _, user_id = await sign_in(client)
 
     async with client.sessions() as session:
         entitlement = await get_entitlement(session, user_id)
 
-        for _ in range(entitlement.limits.daily_ai_queries):
+        for _ in range(entitlement.limits.monthly_ai_queries):
             await check_ai_query(session, user_id, entitlement)
             await record_usage(session, user_id, "ai_queries")
 
@@ -98,31 +98,62 @@ async def test_the_free_daily_allowance_actually_refuses(client):
             await check_ai_query(session, user_id, entitlement)
 
 
-async def test_the_daily_allowance_resets_at_the_students_own_midnight(client):
+async def test_a_months_allowance_is_spendable_in_one_night(client):
     """
-    Not at UTC midnight, which in Nairobi is three in the morning.
+    The reason the daily cap went.
 
-    A student who runs out at nine in the evening is told to come back
-    tomorrow. If the counter is filed under a UTC day, "tomorrow" does not
-    arrive when their phone says midnight -- they open the app at one and are
-    refused again, which reads as the limit being broken rather than kept.
+    Revision happens the night before a CAT, not in even daily portions. A
+    student with a month's questions left must be able to spend all of them in
+    one sitting -- it costs no more than spending them across thirty days, and
+    refusing is refusing at the only moment the app mattered.
+    """
+    _, user_id = await sign_in(client)
+    await give_plan(client, user_id, Tier.STANDARD)
+
+    async with client.sessions() as session:
+        entitlement = await get_entitlement(session, user_id)
+        allowance = entitlement.limits.monthly_ai_queries
+        assert allowance == 400
+
+        # One sitting, no clock advanced between them.
+        for _ in range(allowance):
+            await check_ai_query(session, user_id, entitlement)
+            await record_usage(session, user_id, "ai_queries")
+
+        with pytest.raises(AppError) as refused:
+            await check_ai_query(session, user_id, entitlement)
+
+    assert "this month" in str(refused.value.message)
+
+
+async def test_the_monthly_allowance_turns_over_at_the_students_own_midnight(client):
+    """
+    On the 1st where the student is, not where the server is.
+
+    In Nairobi the last hours of a month are already the next month in UTC. A
+    counter filed on the server's clock would refill three hours early at the
+    end of every month and, worse, tell a student at 2am on the 1st that they
+    are still out of questions.
     """
     from zoneinfo import ZoneInfo
 
-    from app.services.quota import day_key
+    from app.services.quota import UTC_ZONE, month_key, resets_on
 
     nairobi = ZoneInfo("Africa/Nairobi")
 
-    # 21:00 local on the 1st is still the 1st in UTC; 00:30 local on the 2nd is
-    # not -- in UTC it is 21:30 on the 1st, the same day the counter was filed
-    # under before this was fixed.
-    evening = datetime(2026, 3, 1, 21, 0, tzinfo=nairobi)
-    just_after_midnight = datetime(2026, 3, 2, 0, 30, tzinfo=nairobi)
+    last_night = datetime(2026, 3, 31, 23, 30, tzinfo=nairobi)
+    just_after = datetime(2026, 4, 1, 0, 30, tzinfo=nairobi)
 
-    assert day_key(evening, nairobi) == "2026-03-01"
-    assert day_key(just_after_midnight, nairobi) == "2026-03-02"
-    # The bug, stated: on UTC these two are the same day.
-    assert day_key(evening) != day_key(just_after_midnight, nairobi)
+    assert month_key(last_night, nairobi) == "2026-03"
+    assert month_key(just_after, nairobi) == "2026-04"
+    # Half past midnight in Nairobi is half past nine the previous evening in
+    # UTC. The two clocks disagree about which month it is, and the student's
+    # is the one that counts.
+    assert month_key(just_after, UTC_ZONE) == "2026-03"
+
+    # And the app is told when to expect the refill.
+    assert resets_on("ai_queries", nairobi, last_night) == date(2026, 4, 1)
+    assert resets_on("ai_queries_lifetime", nairobi, last_night) is None
 
 
 async def test_a_students_saved_timezone_is_the_one_periods_are_cut_on(client):
@@ -225,7 +256,7 @@ async def test_a_lapsed_plan_falls_to_free_rather_than_to_nothing(client):
     assert entitlement.tier is Tier.FREE
     # What they had is still reportable, so the app can say which plan ended.
     assert entitlement.nominal_tier is Tier.PRO
-    assert entitlement.limits.daily_ai_queries == 5
+    assert entitlement.limits.monthly_ai_queries == 30
 
 
 async def test_a_trial_still_running_is_left_alone(client):
@@ -247,9 +278,9 @@ async def test_a_trial_still_running_is_left_alone(client):
     async with client.sessions() as session:
         entitlement = await get_entitlement(session, user_id)
 
-    trial_questions = plan_for(Tier.TRIAL).limits.daily_ai_queries
+    trial_questions = plan_for(Tier.TRIAL).limits.monthly_ai_queries
     assert entitlement.tier is Tier.TRIAL
-    assert entitlement.limits.daily_ai_queries == trial_questions
+    assert entitlement.limits.monthly_ai_queries == trial_questions
 
 
 async def test_the_old_expired_tier_still_resolves(client):

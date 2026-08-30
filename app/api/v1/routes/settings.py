@@ -14,7 +14,13 @@ from app.models.settings import UserSettings
 from app.services import notifications as notification_service
 from app.services import streak as streak_service
 from app.services.plans import UNLIMITED, plan_for
-from app.services.quota import current_usage, get_entitlement, user_zone
+from app.services.quota import (
+    current_usage,
+    get_entitlement,
+    quiz_metric,
+    resets_on,
+    user_zone,
+)
 
 router = APIRouter()
 
@@ -303,12 +309,16 @@ class MeterOut(BaseModel):
     #: True where the plan sets no ceiling, so the client draws a full bar
     #: rather than dividing by a sentinel.
     unlimited: bool = False
+    #: The day this meter refills, in the student's own timezone. ``None`` on a
+    #: lifetime ceiling, which is not a reset and must not be drawn as a
+    #: countdown to one.
+    resets_at: date | None = None
 
 
 class UsageOut(BaseModel):
     tier: str
     plan_name: str
-    ai_queries_today: MeterOut
+    ai_queries_this_month: MeterOut
     #: Only meaningful where the plan sets a lifetime ceiling — Free. Elsewhere
     #: it reports as unlimited, and the app should not draw a bar for it.
     ai_queries_total: MeterOut
@@ -336,13 +346,15 @@ async def read_usage(user: CurrentUser, session: DbSession) -> UsageOut:
     # clock, and looking it up per bar would be four reads for one answer.
     zone = await user_zone(session, user.id)
 
-    def meter(used: int, limit: int) -> MeterOut:
+    def meter(used: int, limit: int, metric: str) -> MeterOut:
         return MeterOut(
-            used=used, limit=limit, unlimited=limit == UNLIMITED
+            used=used,
+            limit=limit,
+            unlimited=limit == UNLIMITED,
+            resets_at=resets_on(metric, zone),
         )
 
-    weekly = limits.quiz_interval == "weekly"
-    quiz_metric = "quizzes_weekly" if weekly else "quizzes_lifetime"
+    metric = quiz_metric(limits)
 
     units_used = (
         await session.scalar(
@@ -355,21 +367,28 @@ async def read_usage(user: CurrentUser, session: DbSession) -> UsageOut:
     return UsageOut(
         tier=entitlement.tier.value,
         plan_name=plan.name,
-        ai_queries_today=meter(
+        ai_queries_this_month=meter(
             await current_usage(session, user.id, "ai_queries", zone),
-            limits.daily_ai_queries,
+            limits.monthly_ai_queries,
+            "ai_queries",
         ),
         ai_queries_total=meter(
             await current_usage(session, user.id, "ai_queries_lifetime", zone),
             limits.lifetime_ai_queries,
+            "ai_queries_lifetime",
         ),
         quizzes=meter(
-            await current_usage(session, user.id, quiz_metric, zone), limits.quiz_count
+            await current_usage(session, user.id, metric, zone),
+            limits.quiz_count,
+            metric,
         ),
         quiz_interval=limits.quiz_interval,
-        course_units=meter(units_used, limits.max_course_units),
+        # Units are a standing cap, not a meter that refills, so nothing here
+        # rolls over and `resets_at` is deliberately absent.
+        course_units=meter(units_used, limits.max_course_units, "pdf_pages"),
         ocr_pages_this_month=meter(
             await current_usage(session, user.id, "ocr_pages", zone),
             limits.monthly_ocr_page_limit if limits.allow_ocr_scans else 0,
+            "ocr_pages",
         ),
     )

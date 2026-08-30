@@ -167,7 +167,7 @@ async def test_one_student_never_sees_another(client):
 
 async def test_the_unit_cap_rejects_the_row_not_the_request(client):
     """
-    Free allows one unit. The rest are refused — and everything else in the
+    Free allows two units. The rest are refused — and everything else in the
     same push still has to land.
     """
     headers, _ = await sign_in(client)
@@ -198,8 +198,8 @@ async def test_the_unit_cap_rejects_the_row_not_the_request(client):
     )
 
     body = response.json()
-    assert body["units"]["applied"] == 1
-    assert len(body["units"]["rejected"]) == 2
+    assert body["units"]["applied"] == 2
+    assert len(body["units"]["rejected"]) == 1
     # The event is not held hostage by the rejected unit.
     assert body["events"]["applied"] == 1
 

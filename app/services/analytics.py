@@ -232,21 +232,32 @@ async def plan_breakdown(session: AsyncSession) -> list[PlanRow]:
         ).all()
     }
 
-    #: Live Friends groups, for the per-group revenue described above.
-    live_groups = await _count(
-        session,
-        _count_of(
-            PlanGroup, PlanGroup.expires_at.isnot(None), PlanGroup.expires_at > now
-        ),
-    )
+    async def live_groups(tier: Tier) -> int:
+        """
+        Live groups on one tier, for the per-group revenue described above.
+
+        Counted per tier rather than in total: Friends and Friends Season are
+        separate rows on this report and separate prices, and one number shared
+        between them would bill every Season group at the monthly price as
+        well.
+        """
+        return await _count(
+            session,
+            _count_of(
+                PlanGroup,
+                PlanGroup.tier == tier.value,
+                PlanGroup.expires_at.isnot(None),
+                PlanGroup.expires_at > now,
+            ),
+        )
 
     rows: list[PlanRow] = []
     for tier in (Tier.TRIAL, *SELLABLE):
         plan = PLANS[tier]
         counts = await tier_counts(tier)
 
-        if tier is Tier.FRIENDS:
-            billable = live_groups
+        if plan.seats > 1:
+            billable = await live_groups(tier)
         elif tier is Tier.TRIAL:
             billable = 0
         else:

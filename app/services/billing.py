@@ -214,7 +214,7 @@ def tier_from_charge(charge: Charge) -> Tier:
     fact; metadata only narrows it.
 
     Resolution is downward: a payment between two plans buys the lower one.
-    Rounding up would hand out five Friends seats for four seats' money.
+    Rounding up would hand out six Friends seats for five seats' money.
     """
     named = (charge.metadata or {}).get("tier")
 
@@ -227,7 +227,11 @@ def tier_from_charge(charge: Charge) -> Tier:
         if claimed in SELLABLE and charge.amount_kes >= plan_for(claimed).price_ksh:
             return claimed
 
-    for tier in (Tier.FRIENDS, Tier.PRO, Tier.STANDARD):
+    # Every sellable plan, dearest first, so the first match is the most
+    # expensive thing the money covers. Derived from SELLABLE rather than
+    # listed: a hardcoded tuple silently stops resolving the day a plan is
+    # added, and the symptom is a paid student left on Free.
+    for tier in sorted(SELLABLE, key=lambda t: plan_for(t).price_ksh, reverse=True):
         if charge.amount_kes >= plan_for(tier).price_ksh:
             return tier
 
@@ -264,17 +268,22 @@ def assert_charge_belongs_to(charge: Charge, *, user_id: uuid.UUID, email: str |
     )
 
 
-# --- Friends: one payment, five seats ----------------------------------------
+# --- Friends: one payment, six seats -----------------------------------------
 
 
 async def create_group(
-    session: AsyncSession, *, owner_id: uuid.UUID
+    session: AsyncSession, *, owner_id: uuid.UUID, tier: Tier = Tier.FRIENDS
 ) -> PlanGroup:
     """
     Creates the group and seats the payer in it.
 
-    The owner holds one of the five. Anything else would sell five seats and
-    give away six.
+    The owner holds one of the six. Anything else would sell six seats and give
+    away seven.
+
+    ``tier`` is passed in rather than assumed, because Friends now comes in two
+    lengths and the group has to expire when the plan the owner actually bought
+    does — a Season's group living for thirty days would end the plan three
+    months early for everyone on it.
     """
     existing = await session.scalar(
         select(PlanGroup).where(PlanGroup.owner_id == owner_id)
@@ -282,13 +291,13 @@ async def create_group(
     if existing is not None:
         return existing
 
-    plan = plan_for(Tier.FRIENDS)
+    plan = plan_for(tier)
     group = PlanGroup(
         owner_id=owner_id,
-        tier=Tier.FRIENDS.value,
+        tier=plan.id.value,
         seats=plan.seats,
         invite_code=_new_invite_code(),
-        expires_at=new_period_end(Tier.FRIENDS),
+        expires_at=new_period_end(plan.id),
     )
     session.add(group)
     await session.flush()
@@ -362,7 +371,10 @@ async def join_group(
     )
 
     if not own_plan_live:
-        subscription.tier = Tier.FRIENDS.value
+        # The group's own tier, not a hardcoded Friends: a seat on a Season is
+        # a Season, and stamping the monthly tier here would report the wrong
+        # plan name back to a member for four months.
+        subscription.tier = group.tier
         subscription.expires_at = group.expires_at
         subscription.verified = True
         subscription.group_id = group.id

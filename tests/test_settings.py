@@ -277,8 +277,16 @@ async def test_usage_reports_the_free_meters(client):
     body = (await client.get("/api/v1/me/usage", headers=headers)).json()
 
     assert body["tier"] == "free"
-    assert body["ai_queries_today"] == {"used": 0, "limit": 5, "unlimited": False}
-    assert body["course_units"]["limit"] == 1
+    meter = body["ai_queries_this_month"]
+    assert meter["used"] == 0
+    assert meter["limit"] == 30
+    assert meter["unlimited"] is False
+    # The app draws "refills in N days" off this rather than doing calendar
+    # arithmetic of its own.
+    assert meter["resets_at"].endswith("-01")
+    # A lifetime ceiling is not a reset, and must not be drawn as one.
+    assert body["ai_queries_total"]["resets_at"] is None
+    assert body["course_units"]["limit"] == 2
     # No OCR on free, so the meter is a zero ceiling rather than a lie.
     assert body["ocr_pages_this_month"]["limit"] == 0
 

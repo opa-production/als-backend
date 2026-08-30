@@ -12,6 +12,7 @@ from app.schemas.auth import (
     TokenPair,
 )
 from app.services import auth as auth_service
+from app.services import referrals
 from app.services.google import verify_id_token
 from app.services.sms import get_sms_provider
 
@@ -85,6 +86,11 @@ async def verify_otp(payload: OtpVerifyRequest, session: DbSession) -> TokenPair
         device_id=payload.device_id,
     )
 
+    if existing is None:
+        # Only on the request that creates the account. Attribution written any
+        # later is attribution someone adds after they have already paid.
+        await referrals.claim(session, user=user, code=payload.referral_code)
+
     device = await auth_service.register_device(
         session,
         user_id=user.id,
@@ -126,6 +132,14 @@ async def google_sign_in(
         full_name=identity.name,
         device_id=payload.device_id,
     )
+
+    if existing is None:
+        await referrals.claim(session, user=user, code=payload.referral_code)
+
+    if existing is None:
+        # Only on the request that creates the account. Attribution written any
+        # later is attribution someone adds after they have already paid.
+        await referrals.claim(session, user=user, code=payload.referral_code)
 
     device = await auth_service.register_device(
         session,

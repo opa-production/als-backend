@@ -28,7 +28,7 @@ import structlog
 from app.core.config import settings
 from app.core.logging import configure_logging
 from app.db.session import SessionLocal, dispose_engine
-from app.services import notifications
+from app.services import notifications, referrals
 from app.workers import extraction
 
 log = structlog.get_logger()
@@ -158,6 +158,12 @@ class Worker:
         try:
             async with SessionLocal() as session:
                 await notifications.sweep(session, client=client)
+                # Rides the same cadence. Referral rewards move on a seven-day
+                # hold and a ninety-day expiry, so a minute either way is
+                # irrelevant — and a second timer for it would be a second
+                # thing to get wrong.
+                await referrals.sweep(session)
+                await session.commit()
         except Exception:  # noqa: BLE001 — extraction must outlive this
             log.exception("reminder_sweep_failed")
 

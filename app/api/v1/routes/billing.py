@@ -307,13 +307,7 @@ async def verify_payment(
     )
 
     if is_new:
-        await billing_service.activate(
-            session, user_id=user.id, tier=tier, verified=True
-        )
-        if plan_for(tier).seats > 1:
-            await billing_service.open_group(
-                session, owner_id=user.id, tier=tier
-            )
+        await billing_service.apply_payment(session, user_id=user.id, tier=tier)
 
     return await read_subscription(user, session)
 
@@ -390,11 +384,7 @@ async def kora_webhook(
     )
 
     if is_new and charge.status == SUCCESS:
-        await billing_service.activate(session, user_id=owner, tier=tier, verified=True)
-        if plan_for(tier).seats > 1:
-            await billing_service.open_group(
-                session, owner_id=owner, tier=tier
-            )
+        await billing_service.apply_payment(session, user_id=owner, tier=tier)
 
     log.info(
         "kora_webhook_applied",

@@ -1,7 +1,7 @@
 import uuid
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Index, String, UniqueConstraint
+from sqlalchemy import ForeignKey, Index, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, SoftDelete, Timestamps, UuidPK, UUIDPrimaryKey
@@ -38,6 +38,25 @@ class User(Base, UUIDPrimaryKey, Timestamps, SoftDelete):
     #: Storage path in the `avatars` bucket, never a URL. URLs are signed and
     #: expire; the path is what stays true.
     avatar_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+    # --- Referrals --------------------------------------------------------
+    #: This student's own code, minted the first time they look for it rather
+    #: than at sign-up. Most accounts never open the referral screen, and a
+    #: column filled in for all of them is a backfill and a uniqueness problem
+    #: bought for nothing.
+    referral_code: Mapped[str | None] = mapped_column(
+        String(12), unique=True, index=True, nullable=True
+    )
+    #: Who brought them. Written once, at first sign-in, and never again —
+    #: editable attribution is the most-used hole in every referral programme
+    #: ever run ("let me add my friend's code now that I have paid").
+    #:
+    #: ``SET NULL`` rather than cascade: if the referrer deletes their account
+    #: the person they brought is still a real student, and their own row must
+    #: not go with it.
+    referred_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True
+    )
 
     #: The one device allowed to be signed in.
     #:

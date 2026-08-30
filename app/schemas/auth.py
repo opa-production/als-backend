@@ -39,12 +39,17 @@ class OtpVerifyRequest(BaseModel):
     platform: str = Field(default="", max_length=16, examples=["android"])
     app_version: str = Field(default="", max_length=32, examples=["1.0.0"])
 
+    #: A friend's code, if they arrived through one. Only ever read when this
+    #: request creates the account — see `services/referrals.claim`.
+    referral_code: str | None = Field(default=None, max_length=12)
+
 
 class GoogleSignInRequest(BaseModel):
     id_token: str = Field(description="The ID token from Google Sign-In on the device.")
     device_id: uuid.UUID | None = None
     platform: str = Field(default="", max_length=16)
     app_version: str = Field(default="", max_length=32)
+    referral_code: str | None = Field(default=None, max_length=12)
 
 
 class RefreshRequest(BaseModel):

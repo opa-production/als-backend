@@ -12,6 +12,7 @@ from app.models.account import Device
 from app.models.notification import NotificationLog
 from app.models.settings import UserSettings
 from app.services import notifications as notification_service
+from app.services import referrals
 from app.services import streak as streak_service
 from app.services.plans import UNLIMITED, plan_for
 from app.services.quota import (
@@ -298,6 +299,53 @@ async def record_streak(
 
     result = await streak_service.compute(session, user_id=user.id, today=day)
     return StreakOut(**result.__dict__)
+
+
+# --- Referrals ----------------------------------------------------------------
+
+
+class ReferralOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    #: Minted on the first read of this endpoint, then stable forever.
+    code: str
+    #: Signed up with the code. Not the same as earning anything.
+    joined: int
+    #: …and paid, which is what a reward is actually for.
+    paid: int
+    days_earned: int
+    #: Earned but not yet on a plan — either inside the seven-day hold, or
+    #: waiting for the student to subscribe.
+    days_banked: int
+    #: True when those banked days are waiting on a subscription rather than on
+    #: the hold, so the app can say what they are waiting for.
+    banked_pending_subscription: bool
+    #: What a friend gets for using the code, so the share message and the
+    #: server cannot disagree about what was promised.
+    friend_days: int
+
+
+@router.get(
+    "/referrals", response_model=ReferralOut, summary="Your referral code"
+)
+async def read_referrals(user: CurrentUser, session: DbSession) -> ReferralOut:
+    """
+    The code, and what it has earned.
+
+    Reading this is what mints the code — most accounts never open the screen,
+    and a unique column filled in for all of them is a backfill bought for
+    nothing.
+    """
+    result = await referrals.summary(session, user=user)
+    return ReferralOut(
+        code=result.code,
+        joined=result.joined,
+        paid=result.paid,
+        days_earned=result.days_earned,
+        days_banked=result.days_banked,
+        banked_pending_subscription=result.banked_pending_subscription,
+        friend_days=referrals.FRIEND_DAYS,
+    )
 
 
 # --- Usage --------------------------------------------------------------------

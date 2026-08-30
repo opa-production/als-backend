@@ -19,6 +19,7 @@ from app.models.billing import (
     PlanGroupMember,
     Subscription,
 )
+from app.services import referrals
 from app.services.kora import Charge
 from app.services.plans import SELLABLE, Tier, plan_for
 from app.services.quota import new_period_end
@@ -111,6 +112,39 @@ async def activate(
         tier=tier.value,
         verified=verified,
     )
+    return subscription
+
+
+async def apply_payment(
+    session: AsyncSession, *, user_id: uuid.UUID, tier: Tier
+) -> Subscription:
+    """
+    Everything that happens when money actually arrives.
+
+    One function because there are three ways a payment becomes real —
+    `/billing/verify`, the Kora webhook, and the admin reconcile route — and
+    every step that lives outside this one has to be remembered three times.
+    That is not hypothetical: group creation was written at all three sites and
+    still managed to miss Friends Season, which activated the plan and left six
+    seats with no invite code to reach them by.
+
+    So the list lives here. Anything a payment should trigger goes in this
+    function and nowhere else.
+    """
+    subscription = await activate(
+        session, user_id=user_id, tier=tier, verified=True
+    )
+
+    # A plan with seats to give needs somewhere to give them from. Keyed on the
+    # seat count rather than on a named tier, so a new group plan is not the
+    # exception nobody remembered.
+    if plan_for(tier).seats > 1:
+        await open_group(session, owner_id=user_id, tier=tier)
+
+    # Whoever brought them earns, and anything this student banked while they
+    # were on Free is released. Never raises — see the hook itself.
+    await referrals.on_first_payment(session, user_id=user_id, tier=tier)
+
     return subscription
 
 

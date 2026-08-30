@@ -117,14 +117,18 @@ async def plans() -> list[dict]:
     """
     from dataclasses import asdict
 
-    from app.services.plans import PLANS
+    from app.services.plans import PLANS, saving_percent
 
     return [
         {
             "id": plan.id.value,
             "name": plan.name,
+            "family": plan.family,
+            "billing_period": plan.billing_period,
             "price_ksh": plan.price_ksh,
             "price_per_seat_ksh": plan.price_per_seat_ksh,
+            "price_per_month_ksh": plan.price_per_month_ksh,
+            "saving_percent": saving_percent(plan),
             "duration_days": plan.duration_days,
             "seats": plan.seats,
             "limits": asdict(plan.limits),

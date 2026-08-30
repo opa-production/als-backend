@@ -451,3 +451,112 @@ async def test_phone_and_email_stay_out_of_the_referral_payload(client):
         "banked_pending_subscription",
         "friend_days",
     }
+
+
+# --- The console --------------------------------------------------------------
+
+
+async def test_the_console_reads_the_ledger_with_both_sides_named(client):
+    """
+    Every support question about this programme is about a pair, so a row that
+    knows only one of them cannot answer one.
+    """
+    from tests.test_admin import admin_headers
+
+    mine, my_id = await sign_in(client)
+    await _pays(client, my_id, Tier.PRO)
+    code = await _code(client, mine)
+
+    _, friend_id = await _join_with(client, code)
+    await _pays(client, friend_id)
+
+    admin = await admin_headers(client)
+    page = (await client.get("/api/v1/admin/referrals", headers=admin)).json()
+
+    assert page["total"] == 1
+    row = page["items"][0]
+    assert row["referrer_id"] == str(my_id)
+    assert row["referred_user_id"] == str(friend_id)
+    assert row["status"] == "pending"
+    assert row["days"] == referrals.REWARD_DAYS
+
+
+async def test_the_console_can_find_a_referral_from_either_side(client):
+    """
+    A support thread starts with one account and is usually about the other.
+    Asking which end you are holding is asking you to guess.
+    """
+    from tests.test_admin import admin_headers
+
+    mine, my_id = await sign_in(client)
+    await _pays(client, my_id, Tier.PRO)
+    code = await _code(client, mine)
+
+    _, friend_id = await _join_with(client, code)
+    await _pays(client, friend_id)
+
+    admin = await admin_headers(client)
+    for user_id in (my_id, friend_id):
+        found = (
+            await client.get(
+                f"/api/v1/admin/referrals?user_id={user_id}", headers=admin
+            )
+        ).json()
+        assert found["total"] == 1, user_id
+
+
+async def test_the_console_says_why_a_referral_paid_nothing(client):
+    """The refusal is the answer, so it has to be readable without SQL."""
+    from tests.test_admin import admin_headers
+
+    mine, my_id = await sign_in(client)
+    await _pays(client, my_id)
+    code = await _code(client, mine)
+
+    _, friend_id = await _join_with(client, code)
+    async with client.sessions() as session:
+        me = await session.get(User, my_id)
+        friend = await session.get(User, friend_id)
+        friend.active_device_id = me.active_device_id
+        await session.commit()
+    await _pays(client, friend_id)
+
+    admin = await admin_headers(client)
+    page = (
+        await client.get(
+            "/api/v1/admin/referrals?reason=same_device", headers=admin
+        )
+    ).json()
+
+    assert page["total"] == 1
+    assert page["items"][0]["status"] == "voided"
+
+
+async def test_the_console_stats_count_signups_and_payers_apart(client):
+    """
+    Signups against payers is whether the programme works. Conflating them
+    would make it look like it always does.
+    """
+    from tests.test_admin import admin_headers
+
+    mine, my_id = await sign_in(client)
+    await _pays(client, my_id, Tier.PRO)
+    code = await _code(client, mine)
+
+    _, paying = await _join_with(client, code)
+    await _join_with(client, code, phone=THIRD_PHONE)
+    await _pays(client, paying)
+
+    admin = await admin_headers(client)
+    stats = (await client.get("/api/v1/admin/referrals/stats", headers=admin)).json()
+
+    assert stats["referred_signups"] == 2
+    assert stats["referred_payers"] == 1
+    assert stats["rewards_by_status"]["pending"] == 1
+    assert stats["top_referrers"][0]["user_id"] == str(my_id)
+
+
+async def test_a_student_token_cannot_read_the_referral_ledger(client):
+    headers, _ = await sign_in(client)
+    response = await client.get("/api/v1/admin/referrals", headers=headers)
+    assert response.status_code in (401, 403)

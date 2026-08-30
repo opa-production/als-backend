@@ -318,7 +318,14 @@ class GrantSubscription(BaseModel):
     guess.
     """
 
-    tier: str = Field(pattern="^(trial|standard|pro|friends|expired)$")
+    #: Every tier that can be held, including the Seasons and the legacy
+    #: strings. Not built from `SELLABLE`: "free" and "expired" are how a plan
+    #: is taken away, and "trial" is still grantable for the handful of
+    #: accounts support needs to put back where they were.
+    tier: str = Field(
+        pattern="^(free|trial|standard|pro|friends|standard_season|pro_season"
+        "|friends_season|expired)$"
+    )
     days: int | None = Field(
         default=None,
         ge=1,
@@ -467,6 +474,66 @@ class AdminFeatureRequestRow(BaseModel):
     #: having beside a request: paying students asking for the same thing is a
     #: different signal from free ones asking for it.
     tier: str
+
+
+# --- Referrals ---------------------------------------------------------------
+
+
+class AdminReferralRow(BaseModel):
+    """
+    One referral that turned into a payment, and what it was worth.
+
+    Both sides are named, because every support question about this programme
+    is about a pair: "my friend paid and I got nothing" cannot be answered by a
+    row that only knows one of them.
+    """
+
+    id: uuid.UUID
+    referrer_id: uuid.UUID
+    referrer_name: str
+    referred_user_id: uuid.UUID | None
+    referred_name: str
+    status: str
+    #: Empty on a healthy row. On a voided one this is the whole answer:
+    #: self_referral, same_device, monthly_cap, bank_full, bank_expired.
+    reason: str
+    days: int
+    friend_days: int
+    tier: str
+    vest_at: datetime | None
+    banked_until: datetime | None
+    credited_at: datetime | None
+    created_at: datetime
+
+
+class ReferralStatsOut(BaseModel):
+    """
+    Whether the programme is working, and whether it is being gamed.
+
+    ``voided_by_reason`` is the second question. A handful of refusals is the
+    rules doing their job; a spike in ``same_device`` is somebody testing how
+    the rules work, and it is the one number here worth an alert.
+    """
+
+    #: Accounts that arrived with a code, whether or not they ever paid.
+    referred_signups: int
+    #: …and how many of those paid. The conversion the programme exists for.
+    referred_payers: int
+    rewards_by_status: dict[str, int]
+    voided_by_reason: dict[str, int]
+    #: Days handed out, and days waiting on somebody subscribing.
+    days_credited: int
+    days_banked: int
+    #: The referrers who brought the most paying students.
+    top_referrers: list[TopReferrer]
+
+
+class TopReferrer(BaseModel):
+    user_id: uuid.UUID
+    full_name: str
+    institution: str
+    paid_referrals: int
+    days_earned: int
 
 
 # --- Ops ---------------------------------------------------------------------

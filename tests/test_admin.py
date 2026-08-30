@@ -569,6 +569,49 @@ async def test_ops_plans_is_the_server_side_catalogue(client):
     assert plans["free"]["limits"]["monthly_ai_queries"] == 30
 
 
+async def test_a_season_can_be_granted_by_hand(client):
+    """
+    Support has to be able to comp what is on sale.
+
+    The grant schema lists its tiers as a pattern, so every plan added after it
+    was written is refused until somebody remembers this file — which is
+    exactly what happened when Seasons went in.
+    """
+    headers = await admin_headers(client)
+    _, user_id = await sign_in(client)
+
+    granted = await client.post(
+        f"/api/v1/admin/users/{user_id}/subscription",
+        json={"tier": "pro_season", "reason": "Comped for a support case."},
+        headers=headers,
+    )
+
+    assert granted.status_code == 200, granted.text
+
+    detail = (
+        await client.get(f"/api/v1/admin/users/{user_id}", headers=headers)
+    ).json()
+    assert detail["effective_tier"] == "pro_season"
+
+
+async def test_the_plan_catalogue_carries_what_the_pricing_screen_needs(client):
+    """The console and the app read the same catalogue, so it has to be whole."""
+    headers = await admin_headers(client)
+    plans = {
+        row["id"]: row
+        for row in (
+            await client.get("/api/v1/admin/ops/plans", headers=headers)
+        ).json()
+    }
+
+    season = plans["pro_season"]
+    assert season["family"] == "synapse"
+    assert season["billing_period"] == "season"
+    assert season["price_per_month_ksh"] == 275
+    assert season["saving_percent"] == 21
+    assert season["limits"]["monthly_ai_queries"] == 1200
+
+
 # --- Audit -------------------------------------------------------------------
 
 

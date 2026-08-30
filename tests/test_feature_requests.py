@@ -2,8 +2,8 @@
 The feedback box.
 
 Two audiences and one row: a student sends a paragraph, and the console reads
-it. What is worth testing is the boundary between them — one student must not
-see another's, and a student must not be able to fill the table.
+it. What is worth testing is the boundary between them — a student sends and
+sees nothing back, and must not be able to fill the table.
 """
 
 
@@ -27,37 +27,26 @@ async def test_a_student_can_ask_for_a_feature(client):
 
     assert response.status_code == 201
     body = response.json()
-    assert body["body"] == PARAGRAPH
-    assert body["created_at"]
+    # Enough to show a modal, and nothing the app is expected to keep.
+    assert body["message"]
+    assert body["id"]
 
 
-async def test_the_request_comes_back_to_the_student_who_sent_it(client):
-    """The profile screen shows what you asked for, so you do not ask twice."""
+async def test_a_student_cannot_read_their_own_requests_back(client):
+    """
+    Submitting is the whole interaction.
+
+    A "your requests" screen has one honest state — a paragraph with no answer
+    beside it — and that reads as being ignored rather than as being heard. So
+    there is no route to build one against.
+    """
     headers, _ = await sign_in(client)
     await client.post(
         "/api/v1/me/feature-requests", json={"body": PARAGRAPH}, headers=headers
     )
 
     listed = await client.get("/api/v1/me/feature-requests", headers=headers)
-
-    assert listed.status_code == 200
-    assert [row["body"] for row in listed.json()] == [PARAGRAPH]
-
-
-async def test_one_student_never_sees_another_students_requests(client):
-    """
-    Not a public board. Anything else here is a forum, and a forum is a thing
-    that has to be moderated before it is a thing that is useful.
-    """
-    mine, _ = await sign_in(client)
-    theirs, _ = await sign_in(client, phone=OTHER_PHONE)
-
-    await client.post(
-        "/api/v1/me/feature-requests", json={"body": PARAGRAPH}, headers=theirs
-    )
-
-    listed = await client.get("/api/v1/me/feature-requests", headers=mine)
-    assert listed.json() == []
+    assert listed.status_code == 405
 
 
 async def test_a_stray_tap_is_not_a_feature_request(client):

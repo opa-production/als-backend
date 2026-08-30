@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -12,6 +13,7 @@ from app.core.clock import as_utc
 from app.core.clock import now as utc_now
 from app.core.errors import QuotaExceeded
 from app.models.billing import Subscription, UsageCounter
+from app.models.settings import UserSettings
 from app.services.plans import UNLIMITED, Tier, limits_for, plan_for, unit_cap
 
 
@@ -45,34 +47,79 @@ class Entitlement:
 
 
 # --- Periods -----------------------------------------------------------------
+#
+# Every boundary here is cut on the student's own clock, not on UTC. Cut on
+# UTC, a daily allowance comes back at 3am in Nairobi: someone who runs out at
+# nine in the evening is told to come back tomorrow, opens the app at one in
+# the morning, and finds nothing has changed. "Tomorrow" has to mean the
+# moment their phone says midnight, so the zone travels with the period key.
+
+UTC_ZONE = ZoneInfo("UTC")
+
+#: Where a student who has never saved a timezone is assumed to be. Read off
+#: the settings column rather than written out again, so the boundary someone
+#: gets before they open Settings is the one they keep afterwards.
+DEFAULT_ZONE_NAME: str = UserSettings.__table__.c.timezone.default.arg
 
 
-def day_key(moment: datetime | None = None) -> str:
-    return (moment or utc_now()).strftime("%Y-%m-%d")
+def zone_for(name: str | None) -> ZoneInfo:
+    """
+    An IANA name as a zone, falling back rather than failing.
+
+    A name this machine does not know is a bad preference, not an outage, and
+    refusing to serve a quota check over it would lock the student out of the
+    app entirely.
+    """
+    try:
+        return ZoneInfo(name or DEFAULT_ZONE_NAME)
+    except (ZoneInfoNotFoundError, ValueError):
+        return UTC_ZONE
 
 
-def week_key(moment: datetime | None = None) -> str:
+async def user_zone(session: AsyncSession, user_id: uuid.UUID) -> ZoneInfo:
+    """
+    The timezone this student's periods roll over in.
+
+    One narrow read of an indexed column, resolved once per entry point and
+    handed down, rather than per counter touched.
+    """
+    name = await session.scalar(
+        select(UserSettings.timezone).where(UserSettings.user_id == user_id)
+    )
+    return zone_for(name)
+
+
+def _local(moment: datetime | None, zone: ZoneInfo | None) -> datetime:
+    return (moment or utc_now()).astimezone(zone or zone_for(None))
+
+
+def day_key(moment: datetime | None = None, zone: ZoneInfo | None = None) -> str:
+    return _local(moment, zone).strftime("%Y-%m-%d")
+
+
+def week_key(moment: datetime | None = None, zone: ZoneInfo | None = None) -> str:
     """
     ISO week, Monday-first, matching the client's own week boundary.
 
     If the two disagreed, a student would see five quizzes left on the phone
     and be refused by the server, which reads as a bug rather than a limit.
     """
-    return (moment or utc_now()).strftime("%G-W%V")
+    return _local(moment, zone).strftime("%G-W%V")
 
 
-def month_key(moment: datetime | None = None) -> str:
-    return (moment or utc_now()).strftime("%Y-%m")
+def month_key(moment: datetime | None = None, zone: ZoneInfo | None = None) -> str:
+    return _local(moment, zone).strftime("%Y-%m")
 
 
-#: Which period each metered thing rolls over on.
+#: Which period each metered thing rolls over on. Every entry takes the same
+#: ``(moment, zone)`` shape so callers never have to know which ones care.
 METRIC_PERIODS = {
     "ai_queries": day_key,
-    "ai_queries_lifetime": lambda _=None: "lifetime",
+    "ai_queries_lifetime": lambda moment=None, zone=None: "lifetime",
     "quizzes_weekly": week_key,
-    "quizzes_lifetime": lambda _=None: "lifetime",
+    "quizzes_lifetime": lambda moment=None, zone=None: "lifetime",
     "ocr_pages": month_key,
-    "pdf_pages": lambda _=None: "lifetime",
+    "pdf_pages": lambda moment=None, zone=None: "lifetime",
 }
 
 
@@ -143,15 +190,30 @@ async def _counter(
 
 
 async def current_usage(
-    session: AsyncSession, user_id: uuid.UUID, metric: str
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    metric: str,
+    zone: ZoneInfo | None = None,
 ) -> int:
-    period = METRIC_PERIODS[metric]()
+    """
+    What this student has spent in the period they are currently living in.
+
+    ``zone`` is looked up when it is not passed. Callers that touch several
+    metrics resolve it once and hand it in — the answer is the same for all of
+    them, and reading it per metric is a query per bar on the Usage screen.
+    """
+    zone = zone or await user_zone(session, user_id)
+    period = METRIC_PERIODS[metric](None, zone)
     row = await _counter(session, user_id, metric, period)
     return row.count if row else 0
 
 
 async def record_usage(
-    session: AsyncSession, user_id: uuid.UUID, metric: str, amount: int = 1
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    metric: str,
+    amount: int = 1,
+    zone: ZoneInfo | None = None,
 ) -> int:
     """
     Adds to a counter, creating the period's row on first use.
@@ -163,7 +225,8 @@ async def record_usage(
     daily quota is a cost this does not need to pay a raced transaction to
     prevent.
     """
-    period = METRIC_PERIODS[metric]()
+    zone = zone or await user_zone(session, user_id)
+    period = METRIC_PERIODS[metric](None, zone)
     row = await _counter(session, user_id, metric, period)
 
     if row is not None:
@@ -192,7 +255,9 @@ async def record_usage(
                 metric=metric,
                 period_key=period,
                 count=amount,
-                period_date=date.today(),
+                #: The student's local day, so this column agrees with the
+                #: period key beside it rather than with the server's UTC one.
+                period_date=_local(None, zone).date(),
             )
             session.add(row)
             await session.flush()
@@ -243,9 +308,10 @@ async def check_ai_query(
     a reset that is never coming is worse than telling them the truth.
     """
     limits = entitlement.limits
+    zone = await user_zone(session, user_id)
 
     if limits.lifetime_ai_queries != UNLIMITED:
-        spent = await current_usage(session, user_id, "ai_queries_lifetime")
+        spent = await current_usage(session, user_id, "ai_queries_lifetime", zone)
         if spent >= limits.lifetime_ai_queries:
             raise QuotaExceeded(
                 f"You have used all {limits.lifetime_ai_queries} questions the "
@@ -256,7 +322,7 @@ async def check_ai_query(
     if limit == UNLIMITED:
         return
 
-    used = await current_usage(session, user_id, "ai_queries")
+    used = await current_usage(session, user_id, "ai_queries", zone)
     if used >= limit:
         raise QuotaExceeded(f"You have used today's {limit} AI questions.")
 
@@ -273,8 +339,9 @@ async def record_ai_query(session: AsyncSession, user_id: uuid.UUID) -> None:
     row per account and means a student who pays, lapses, and lands back on
     Free is measured from where they actually got to.
     """
-    await record_usage(session, user_id, "ai_queries")
-    await record_usage(session, user_id, "ai_queries_lifetime")
+    zone = await user_zone(session, user_id)
+    await record_usage(session, user_id, "ai_queries", zone=zone)
+    await record_usage(session, user_id, "ai_queries_lifetime", zone=zone)
 
 
 async def check_quiz(

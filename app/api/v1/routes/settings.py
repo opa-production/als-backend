@@ -14,7 +14,7 @@ from app.models.settings import UserSettings
 from app.services import notifications as notification_service
 from app.services import streak as streak_service
 from app.services.plans import UNLIMITED, plan_for
-from app.services.quota import current_usage, get_entitlement
+from app.services.quota import current_usage, get_entitlement, user_zone
 
 router = APIRouter()
 
@@ -332,6 +332,10 @@ async def read_usage(user: CurrentUser, session: DbSession) -> UsageOut:
     limits = entitlement.limits
     plan = plan_for(entitlement.tier)
 
+    # Resolved once for every meter below: they all roll over on the same
+    # clock, and looking it up per bar would be four reads for one answer.
+    zone = await user_zone(session, user.id)
+
     def meter(used: int, limit: int) -> MeterOut:
         return MeterOut(
             used=used, limit=limit, unlimited=limit == UNLIMITED
@@ -352,20 +356,20 @@ async def read_usage(user: CurrentUser, session: DbSession) -> UsageOut:
         tier=entitlement.tier.value,
         plan_name=plan.name,
         ai_queries_today=meter(
-            await current_usage(session, user.id, "ai_queries"),
+            await current_usage(session, user.id, "ai_queries", zone),
             limits.daily_ai_queries,
         ),
         ai_queries_total=meter(
-            await current_usage(session, user.id, "ai_queries_lifetime"),
+            await current_usage(session, user.id, "ai_queries_lifetime", zone),
             limits.lifetime_ai_queries,
         ),
         quizzes=meter(
-            await current_usage(session, user.id, quiz_metric), limits.quiz_count
+            await current_usage(session, user.id, quiz_metric, zone), limits.quiz_count
         ),
         quiz_interval=limits.quiz_interval,
         course_units=meter(units_used, limits.max_course_units),
         ocr_pages_this_month=meter(
-            await current_usage(session, user.id, "ocr_pages"),
+            await current_usage(session, user.id, "ocr_pages", zone),
             limits.monthly_ocr_page_limit if limits.allow_ocr_scans else 0,
         ),
     )

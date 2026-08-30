@@ -33,7 +33,12 @@ from app.services import analytics
 from app.services import audit as audit_service
 from app.services import billing as billing_service
 from app.services.plans import Tier, plan_for
-from app.services.quota import METRIC_PERIODS, get_entitlement, new_period_end
+from app.services.quota import (
+    METRIC_PERIODS,
+    get_entitlement,
+    new_period_end,
+    user_zone,
+)
 
 router = APIRouter()
 
@@ -570,12 +575,15 @@ async def get_usage(user_id: uuid.UUID, session: DbSession) -> dict:
     """
     await _load(session, user_id)
     entitlement = await get_entitlement(session, user_id)
+    # This student's zone, not the server's: the periods shown here have to be
+    # the ones their counters are actually filed under.
+    zone = await user_zone(session, user_id)
 
     return {
         "tier": entitlement.tier.value,
         "plan_name": plan_for(entitlement.tier).name,
         "current_periods": {
-            metric: period() for metric, period in METRIC_PERIODS.items()
+            metric: period(None, zone) for metric, period in METRIC_PERIODS.items()
         },
         "counters": await analytics.usage_rows(session, user_id),
         "limits": asdict(entitlement.limits),

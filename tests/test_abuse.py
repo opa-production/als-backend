@@ -7,7 +7,7 @@ not just what the assertion is.
 """
 
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import select
@@ -16,9 +16,15 @@ from app.core.clock import now as utc_now
 from app.core.errors import AppError
 from app.models.account import User
 from app.models.billing import Subscription
+from app.models.settings import UserSettings
 from app.services.billing import activate, assert_charge_belongs_to
 from app.services.plans import Tier, plan_for
-from app.services.quota import check_ai_query, get_entitlement, record_usage
+from app.services.quota import (
+    check_ai_query,
+    get_entitlement,
+    record_usage,
+    user_zone,
+)
 from tests.conftest import OTHER_PHONE, PHONE, give_plan, sign_in
 from tests.test_billing import _charge
 
@@ -90,6 +96,67 @@ async def test_the_free_daily_allowance_actually_refuses(client):
 
         with pytest.raises(AppError):
             await check_ai_query(session, user_id, entitlement)
+
+
+async def test_the_daily_allowance_resets_at_the_students_own_midnight(client):
+    """
+    Not at UTC midnight, which in Nairobi is three in the morning.
+
+    A student who runs out at nine in the evening is told to come back
+    tomorrow. If the counter is filed under a UTC day, "tomorrow" does not
+    arrive when their phone says midnight -- they open the app at one and are
+    refused again, which reads as the limit being broken rather than kept.
+    """
+    from zoneinfo import ZoneInfo
+
+    from app.services.quota import day_key
+
+    nairobi = ZoneInfo("Africa/Nairobi")
+
+    # 21:00 local on the 1st is still the 1st in UTC; 00:30 local on the 2nd is
+    # not -- in UTC it is 21:30 on the 1st, the same day the counter was filed
+    # under before this was fixed.
+    evening = datetime(2026, 3, 1, 21, 0, tzinfo=nairobi)
+    just_after_midnight = datetime(2026, 3, 2, 0, 30, tzinfo=nairobi)
+
+    assert day_key(evening, nairobi) == "2026-03-01"
+    assert day_key(just_after_midnight, nairobi) == "2026-03-02"
+    # The bug, stated: on UTC these two are the same day.
+    assert day_key(evening) != day_key(just_after_midnight, nairobi)
+
+
+async def test_a_students_saved_timezone_is_the_one_periods_are_cut_on(client):
+    """
+    Someone who travels takes their day boundary with them.
+
+    The zone comes from the settings row, so the reset a student sees is the
+    one their own clock predicts rather than the server's.
+    """
+    _, user_id = await sign_in(client)
+
+    async with client.sessions() as session:
+        # Nobody has opened Settings yet: the column default stands in.
+        assert (await user_zone(session, user_id)).key == "Africa/Nairobi"
+
+        session.add(UserSettings(user_id=user_id, timezone="America/New_York"))
+        await session.commit()
+
+    async with client.sessions() as session:
+        assert (await user_zone(session, user_id)).key == "America/New_York"
+
+
+async def test_an_unknown_timezone_does_not_break_the_tutor(client):
+    """A typo the client let through is a preference, not an outage."""
+    _, user_id = await sign_in(client)
+
+    async with client.sessions() as session:
+        session.add(UserSettings(user_id=user_id, timezone="Mars/Olympus_Mons"))
+        await session.commit()
+
+    async with client.sessions() as session:
+        entitlement = await get_entitlement(session, user_id)
+        await check_ai_query(session, user_id, entitlement)
+        assert await record_usage(session, user_id, "ai_queries") == 1
 
 
 async def test_the_free_plan_runs_out_for_good(client):

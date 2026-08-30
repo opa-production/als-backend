@@ -208,7 +208,7 @@ async def reconcile(
         # on the seat count rather than on one tier, so a Season is not the
         # exception nobody remembered.
         if plan_for(tier).seats > 1:
-            await billing_service.create_group(
+            await billing_service.open_group(
                 session, owner_id=user.id, tier=tier
             )
         activated = True

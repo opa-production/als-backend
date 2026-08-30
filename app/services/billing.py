@@ -5,7 +5,7 @@ import string
 import uuid
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.clock import as_utc
@@ -271,38 +271,76 @@ def assert_charge_belongs_to(charge: Charge, *, user_id: uuid.UUID, email: str |
 # --- Friends: one payment, six seats -----------------------------------------
 
 
-async def create_group(
+async def open_group(
     session: AsyncSession, *, owner_id: uuid.UUID, tier: Tier = Tier.FRIENDS
 ) -> PlanGroup:
     """
-    Creates the group and seats the payer in it.
+    Opens the owner's group, or brings an existing one up to what they just
+    bought.
 
-    The owner holds one of the six. Anything else would sell six seats and give
-    away seven.
+    The renewal half is the part that matters, and it was missing. A group is
+    created once and then found on every later payment, so returning the
+    existing row untouched meant a Friends plan renewed for a second month
+    extended *the owner's* subscription and nobody else's: the group still
+    expired on the old date, every seat with it, and the next friend to tap the
+    invite link was told the plan had expired. Six people paid; one of them
+    kept working.
+
+    So an existing group is re-dated here, along with the seats sitting in it.
+    Only subscriptions that came *from* this group are touched — someone who
+    joined while holding their own paid plan keeps it, exactly as they do when
+    a seat is taken away.
 
     ``tier`` is passed in rather than assumed, because Friends now comes in two
-    lengths and the group has to expire when the plan the owner actually bought
-    does — a Season's group living for thirty days would end the plan three
-    months early for everyone on it.
+    lengths and a group has to expire when the plan the owner actually bought
+    does — a Season's group living thirty days would end it three months early
+    for everyone on it.
     """
-    existing = await session.scalar(
+    plan = plan_for(tier)
+    group = await session.scalar(
         select(PlanGroup).where(PlanGroup.owner_id == owner_id)
     )
-    if existing is not None:
-        return existing
 
-    plan = plan_for(tier)
-    group = PlanGroup(
-        owner_id=owner_id,
-        tier=plan.id.value,
-        seats=plan.seats,
-        invite_code=_new_invite_code(),
-        expires_at=new_period_end(plan.id),
+    if group is None:
+        # The owner holds one of the six. Anything else would sell six seats
+        # and give away seven.
+        group = PlanGroup(
+            owner_id=owner_id,
+            tier=plan.id.value,
+            seats=plan.seats,
+            invite_code=_new_invite_code(),
+            expires_at=new_period_end(plan.id),
+        )
+        session.add(group)
+        await session.flush()
+
+        session.add(PlanGroupMember(group_id=group.id, user_id=owner_id))
+        await session.flush()
+
+        return group
+
+    # Renewing, or moving between Friends and Friends Season. The owner's own
+    # subscription has already been extended by `activate`, and this is the
+    # same date: read it back rather than computing a second one, so the plan
+    # and the group cannot end on different days.
+    owner_subscription = await session.scalar(
+        select(Subscription).where(Subscription.user_id == owner_id)
     )
-    session.add(group)
-    await session.flush()
+    if owner_subscription is not None and owner_subscription.expires_at is not None:
+        group.expires_at = owner_subscription.expires_at
 
-    session.add(PlanGroupMember(group_id=group.id, user_id=owner_id))
+    group.tier = plan.id.value
+    # Never below the seats already taken: shrinking a plan out from under
+    # someone who is sitting in it is not a thing a renewal should do.
+    group.seats = max(plan.seats, await seats_taken(session, group.id))
+
+    # And the seats follow the group. Scoped to `group_id`, so a member who
+    # kept their own paid plan when they joined is not touched.
+    await session.execute(
+        update(Subscription)
+        .where(Subscription.group_id == group.id)
+        .values(tier=group.tier, expires_at=group.expires_at, verified=True)
+    )
     await session.flush()
 
     return group

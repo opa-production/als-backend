@@ -15,9 +15,11 @@ import httpx
 import pytest
 
 from app.api.deps import get_http_client
+from app.core.clock import as_utc
 from app.core.clock import now as utc_now
 from app.core.config import settings
 from app.main import app
+from app.services import billing as billing_service
 from app.services.billing import activate, tier_from_charge
 from app.services.kora import Charge, to_shillings, verify_signature
 from app.services.plans import Tier, plan_for, saving_percent
@@ -274,6 +276,11 @@ def test_a_season_is_cheaper_per_month_than_paying_monthly():
         # A monthly plan is the baseline, so it never wears a saving badge.
         assert saving_percent(plan_for(monthly)) == 0
 
+    # Floored, not rounded: Focus Season saves 16.7% and the badge says 16.
+    # Overstating by a point is a claim a student cannot reproduce from the
+    # two prices printed next to it.
+    assert saving_percent(plan_for(Tier.STANDARD_SEASON)) == 16
+
 
 async def test_the_plans_payload_pairs_each_card(client):
     """
@@ -317,8 +324,104 @@ async def test_a_friends_season_group_lasts_as_long_as_the_plan(client):
     group = (await client.post("/api/v1/billing/group", headers=headers)).json()
 
     assert group["seats"] == 6
-    expires = datetime.fromisoformat(group["expires_at"])
+    expires = as_utc(datetime.fromisoformat(group["expires_at"]))
     assert (expires - utc_now()).days == pytest.approx(120, abs=1)
+
+
+async def test_renewing_a_group_carries_the_seats_with_it(client):
+    """
+    The bug this was written for: renewing extended the owner's plan and
+    nobody else's.
+
+    A group is created once and found on every payment after that, so a
+    renewal that returned it untouched left the group -- and every seat in it
+    -- expiring on the old date. Six people paid and one of them kept working.
+    """
+    owner_headers, owner_id = await _friends_owner(client)
+    group = (
+        await client.post("/api/v1/billing/group", headers=owner_headers)
+    ).json()
+    # SQLite hands timestamps back without a zone, so both sides go through
+    # `as_utc` before they are compared -- the same normalisation the service
+    # does on every read.
+    first_end = as_utc(datetime.fromisoformat(group["expires_at"]))
+
+    friend_headers, friend_id = await sign_in(client, phone=OTHER_PHONE)
+    await client.post(
+        "/api/v1/billing/group/join",
+        json={"code": group["invite_code"]},
+        headers=friend_headers,
+    )
+
+    # A second month.
+    async with client.sessions() as session:
+        await activate(session, user_id=owner_id, tier=Tier.FRIENDS, verified=True)
+        await billing_service.open_group(session, owner_id=owner_id, tier=Tier.FRIENDS)
+        await session.commit()
+
+    renewed = (await client.get("/api/v1/billing/group", headers=owner_headers)).json()
+    assert as_utc(datetime.fromisoformat(renewed["expires_at"])) > first_end
+
+    seat = (
+        await client.get("/api/v1/billing/subscription", headers=friend_headers)
+    ).json()
+    assert as_utc(datetime.fromisoformat(seat["expires_at"])) > first_end
+
+
+async def test_upgrading_a_group_to_a_season_re_dates_everyone(client):
+    """
+    Buying four months for the table has to give the table four months.
+    """
+    owner_headers, owner_id = await _friends_owner(client)
+    group = (
+        await client.post("/api/v1/billing/group", headers=owner_headers)
+    ).json()
+
+    friend_headers, _ = await sign_in(client, phone=OTHER_PHONE)
+    await client.post(
+        "/api/v1/billing/group/join",
+        json={"code": group["invite_code"]},
+        headers=friend_headers,
+    )
+
+    async with client.sessions() as session:
+        await activate(
+            session, user_id=owner_id, tier=Tier.FRIENDS_SEASON, verified=True
+        )
+        await billing_service.open_group(
+            session, owner_id=owner_id, tier=Tier.FRIENDS_SEASON
+        )
+        await session.commit()
+
+    seat = (
+        await client.get("/api/v1/billing/subscription", headers=friend_headers)
+    ).json()
+
+    assert seat["tier"] == "friends_season"
+    assert (
+        as_utc(datetime.fromisoformat(seat["expires_at"])) - utc_now()
+    ).days == pytest.approx(120, abs=1)
+
+
+async def test_a_renewal_never_shrinks_a_group_under_its_members(client):
+    """
+    Seats can grow with a plan. They must not fall below the people already
+    sitting in them, whatever a future plan says.
+    """
+    owner_headers, owner_id = await _friends_owner(client)
+    await client.post("/api/v1/billing/group", headers=owner_headers)
+
+    async with client.sessions() as session:
+        group = await billing_service.open_group(session, owner_id=owner_id)
+        group.seats = 2
+        await session.commit()
+
+    async with client.sessions() as session:
+        renewed = await billing_service.open_group(session, owner_id=owner_id)
+        await session.commit()
+
+    # Back up to the plan's own six, not down to anything.
+    assert renewed.seats == 6
 
 
 async def test_a_seat_on_a_season_reports_the_season(client):

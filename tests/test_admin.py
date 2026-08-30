@@ -318,7 +318,7 @@ async def test_mrr_counts_a_friends_group_once_not_five_times(client):
         await billing_service.activate(
             session, user_id=owner_id, tier=Tier.FRIENDS, verified=True
         )
-        group = await billing_service.create_group(session, owner_id=owner_id)
+        group = await billing_service.open_group(session, owner_id=owner_id)
         await billing_service.join_group(
             session, user_id=joiner_id, code=group.invite_code
         )

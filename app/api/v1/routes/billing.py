@@ -311,7 +311,7 @@ async def verify_payment(
             session, user_id=user.id, tier=tier, verified=True
         )
         if plan_for(tier).seats > 1:
-            await billing_service.create_group(
+            await billing_service.open_group(
                 session, owner_id=user.id, tier=tier
             )
 
@@ -392,7 +392,7 @@ async def kora_webhook(
     if is_new and charge.status == SUCCESS:
         await billing_service.activate(session, user_id=owner, tier=tier, verified=True)
         if plan_for(tier).seats > 1:
-            await billing_service.create_group(
+            await billing_service.open_group(
                 session, owner_id=owner, tier=tier
             )
 
@@ -432,7 +432,7 @@ async def create_group(user: CurrentUser, session: DbSession) -> GroupOut:
     if plan.seats <= 1:
         raise Forbidden("A Friends plan is needed before you can invite anyone.")
 
-    group = await billing_service.create_group(
+    group = await billing_service.open_group(
         session, owner_id=user.id, tier=entitlement.tier
     )
     return GroupOut(

@@ -232,7 +232,11 @@ PLANS: dict[Tier, Plan] = {
             total_pdf_pages_pool=100,
             max_single_file_size_mb=10,
             max_single_file_pages=30,
-            monthly_ai_queries=450,
+            # The fortnight's worth, on a clock that now counts months. The
+            # trial was fifteen questions a day for fourteen days, and 450 —
+            # thirty days of it — would hand the last people inside one more
+            # than they were ever promised.
+            monthly_ai_queries=210,
             # The fortnight is the ceiling on a trial. It ends on its own.
             lifetime_ai_queries=UNLIMITED,
             quiz_count=2,
@@ -378,12 +382,17 @@ def saving_percent(plan: Plan) -> int:
     "no badge". Computed from the two prices rather than written down, because
     a saving that is typed in is a saving that survives a price change and
     starts lying.
+
+    Floored, never rounded. Focus Season saves 16.7%, and a badge promising 17%
+    is a number nobody can reproduce from the two prices printed beside it —
+    small, but it is the kind of small that a student notices and we cannot
+    explain. Understating is free; overstating is a claim.
     """
     monthly = monthly_counterpart(plan)
     if monthly is None or monthly.price_ksh <= 0:
         return 0
 
-    return round(100 * (1 - plan.price_per_month_ksh / monthly.price_ksh))
+    return int(100 * (1 - plan.price_per_month_ksh / monthly.price_ksh))
 
 
 def limits_for(tier: str | Tier) -> Limits:

@@ -21,16 +21,19 @@ records what it was asked, which is where the interesting assertions are — the
 import json
 import uuid
 from collections.abc import AsyncIterator
+from datetime import timedelta
 
 import pytest
+from sqlalchemy import select
 
+from app.core.clock import now as utc_now
 from app.core.config import settings
 from app.models.course import Unit
 from app.models.knowledge import Material, MaterialChunk
 from app.services.ai import pipeline, prompts, providers, retrieval
 from app.services.ai.providers import Message, Usage
 from app.services.ai.sanitise import OpenerGuard, StreamCleaner
-from tests.conftest import OTHER_PHONE, sign_in
+from tests.conftest import OTHER_PHONE, PHONE, sign_in
 
 NOTES = (
     "A deadlock occurs when two processes each hold a resource the other needs "
@@ -869,6 +872,231 @@ async def test_small_talk_still_knows_which_unit_is_open(client, fake_model):
     )
 
     assert "COMP333" in fake_model.system_prompt
+
+
+async def test_the_tutor_is_told_who_it_is_talking_to(client, fake_model):
+    """
+    A name, a year and a course, from the account the student already filled in.
+
+    Without it the tutor opens with "as a student" at someone whose name and
+    programme are sitting one table away, which is the difference between an
+    assistant and a search box.
+    """
+    headers, user_id = await sign_in(client)
+    await _give_notes(client, user_id, code="COMP333")
+
+    await client.patch(
+        "/api/v1/me",
+        json={
+            "full_name": "Brian Otieno",
+            "institution": "JKUAT",
+            "program": "BSc Chemistry",
+            "year_of_study": 3,
+        },
+        headers=headers,
+    )
+
+    await client.post(
+        "/api/v1/tutor/ask",
+        json={"question": "What is a deadlock?", "unit_code": "COMP333"},
+        headers=headers,
+    )
+
+    prompt = fake_model.system_prompt
+    assert "Brian" in prompt
+    assert "BSc Chemistry" in prompt
+    assert "JKUAT" in prompt
+    # First name only: a surname buys the tutor nothing.
+    assert "Otieno" not in prompt
+    # And never the things that identify an account rather than a person.
+    assert PHONE not in prompt
+
+
+async def test_the_tutor_can_see_this_weeks_deadlines(client, fake_model):
+    """
+    The part a browser chatbot structurally cannot have.
+
+    "Help me revise" is a different answer when the server knows there is a CAT
+    on Friday, and that knowledge is already in the planner.
+    """
+    from app.models.planner import Event
+
+    headers, user_id = await sign_in(client)
+    await _give_notes(client, user_id, code="COMP333")
+
+    async with client.sessions() as session:
+        session.add(
+            Event(
+                id=uuid.uuid4(),
+                user_id=user_id,
+                title="Deadlock and scheduling",
+                kind="cat",
+                due_at=utc_now() + timedelta(days=3),
+            )
+        )
+        await session.commit()
+
+    await client.post(
+        "/api/v1/tutor/ask",
+        json={"question": "What should I revise?", "unit_code": "COMP333"},
+        headers=headers,
+    )
+
+    prompt = fake_model.system_prompt
+    assert "Deadlock and scheduling" in prompt
+    # An initialism, not an animal.
+    assert "CAT:" in prompt
+    assert "in 3 days" in prompt
+
+
+async def test_a_finished_or_far_off_deadline_is_not_mentioned(client, fake_model):
+    """
+    Context costs tokens on every question, so it carries only what is live.
+
+    Something already ticked off, and something due in March, are both noise in
+    a chat window in August.
+    """
+    from app.models.planner import Event
+
+    headers, user_id = await sign_in(client)
+    await _give_notes(client, user_id, code="COMP333")
+
+    async with client.sessions() as session:
+        session.add_all(
+            [
+                Event(
+                    id=uuid.uuid4(),
+                    user_id=user_id,
+                    title="Already handed in",
+                    kind="assignment",
+                    due_at=utc_now() + timedelta(days=2),
+                    done=True,
+                ),
+                Event(
+                    id=uuid.uuid4(),
+                    user_id=user_id,
+                    title="Next semester exam",
+                    kind="exam",
+                    due_at=utc_now() + timedelta(days=120),
+                ),
+            ]
+        )
+        await session.commit()
+
+    await client.post(
+        "/api/v1/tutor/ask",
+        json={"question": "What should I revise?", "unit_code": "COMP333"},
+        headers=headers,
+    )
+
+    assert "Already handed in" not in fake_model.system_prompt
+    assert "Next semester exam" not in fake_model.system_prompt
+
+
+async def test_the_tutor_can_see_todays_timetable(client, fake_model):
+    """
+    Today, on the student's own clock -- the same rule quotas turn over on.
+    """
+    from datetime import time
+
+    from app.core.clock import now as clock_now
+    from app.models.course import ClassSession, Unit
+    from app.services.zones import user_zone
+
+    headers, user_id = await sign_in(client)
+    await _give_notes(client, user_id, code="COMP333")
+
+    async with client.sessions() as session:
+        unit = await session.scalar(select(Unit).where(Unit.user_id == user_id))
+        zone = await user_zone(session, user_id)
+        today = clock_now().astimezone(zone).date()
+
+        session.add(
+            ClassSession(
+                id=uuid.uuid4(),
+                user_id=user_id,
+                unit_id=unit.id,
+                weekday=ClassSession.weekday_of(today),
+                starts_at=time(8, 0),
+                ends_at=time(10, 0),
+                room="LH3",
+            )
+        )
+        await session.commit()
+
+    await client.post(
+        "/api/v1/tutor/ask",
+        json={"question": "What is a deadlock?", "unit_code": "COMP333"},
+        headers=headers,
+    )
+
+    prompt = fake_model.system_prompt
+    assert "08:00" in prompt
+    assert "LH3" in prompt
+
+
+async def test_the_tutor_knows_how_long_they_have_kept_it_up(client, fake_model):
+    """
+    The streak the app already draws on its own screen.
+
+    Without it the tutor is the one part of the product with no idea the
+    student has turned up eleven days running.
+    """
+    from datetime import date as date_type
+
+    from app.models.settings import StudyDay
+    from app.services.zones import user_zone
+
+    headers, user_id = await sign_in(client)
+    await _give_notes(client, user_id, code="COMP333")
+
+    async with client.sessions() as session:
+        zone = await user_zone(session, user_id)
+        today: date_type = utc_now().astimezone(zone).date()
+        # Yesterday backwards: a run that has not been continued today is
+        # still live, because the day is not over.
+        for back in range(1, 12):
+            session.add(StudyDay(user_id=user_id, day=today - timedelta(days=back)))
+        await session.commit()
+
+    await client.post(
+        "/api/v1/tutor/ask",
+        json={"question": "What is a deadlock?", "unit_code": "COMP333"},
+        headers=headers,
+    )
+
+    prompt = fake_model.system_prompt
+    assert "11 days in a row" in prompt
+    assert "Today is not counted yet" in prompt
+    # And the restraint, which is the larger half of putting it there at all.
+    assert "Never open with it" in prompt
+
+
+async def test_a_single_day_is_not_a_streak(client, fake_model):
+    """
+    One day is "they used the app", which the model can tell from being asked
+    a question. Tokens on every request are not spent saying it.
+    """
+    from app.models.settings import StudyDay
+    from app.services.zones import user_zone
+
+    headers, user_id = await sign_in(client)
+    await _give_notes(client, user_id, code="COMP333")
+
+    async with client.sessions() as session:
+        zone = await user_zone(session, user_id)
+        session.add(
+            StudyDay(user_id=user_id, day=utc_now().astimezone(zone).date())
+        )
+        await session.commit()
+
+    await client.post(
+        "/api/v1/tutor/ask",
+        json={"question": "What is a deadlock?", "unit_code": "COMP333"},
+        headers=headers,
+    )
+
+    assert "in a row" not in fake_model.system_prompt
 
 
 async def test_a_question_about_the_pdf_itself_is_answered_from_the_pdf(

@@ -19,8 +19,8 @@ from __future__ import annotations
 import uuid
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 import httpx
 import structlog
@@ -37,6 +37,7 @@ from app.models.planner import Event
 from app.models.settings import UserSettings
 from app.services import push as push_service
 from app.services.push import PushMessage, PushProvider
+from app.services.zones import zone_for
 
 log = structlog.get_logger()
 
@@ -276,7 +277,8 @@ async def _due_classes(
         for day in (local_now.date(), local_now.date() + timedelta(days=1)):
             # 0 = Sunday on the model, matching JavaScript's getDay(); Python's
             # weekday() is Monday-based, so this is not a straight comparison.
-            if _js_weekday(day) != slot.weekday:
+            # `weekday_of` is the model's own conversion.
+            if ClassSession.weekday_of(day) != slot.weekday:
                 continue
 
             starts_at = datetime.combine(day, slot.starts_at, tzinfo=zone)
@@ -309,26 +311,12 @@ def _class_body(slot: ClassSession, unit: Unit) -> str:
     return f"{unit.title} · {when}"
 
 
-def _js_weekday(day: date) -> int:
-    """Sunday-based, to match ``ClassSession.weekday``."""
-    return (day.weekday() + 1) % 7
-
-
 # --- Quiet hours --------------------------------------------------------------
 
 
 def _zone(preference: UserSettings) -> ZoneInfo:
-    """
-    The student's timezone, or UTC if it is not one this machine knows.
-
-    A bad name is a preference, not an outage: refusing to notify at all would
-    punish a student for a typo the client let through.
-    """
-    try:
-        return ZoneInfo(preference.timezone or "UTC")
-    except (ZoneInfoNotFoundError, ValueError):
-        log.warning("notification_unknown_timezone", timezone=preference.timezone)
-        return UTC
+    """The student's timezone, resolved by the same rule quotas use."""
+    return zone_for(preference.timezone)
 
 
 def _in_quiet_hours(preference: UserSettings, moment: datetime) -> bool:

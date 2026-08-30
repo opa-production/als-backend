@@ -137,7 +137,8 @@ async def test_the_monthly_allowance_turns_over_at_the_students_own_midnight(cli
     """
     from zoneinfo import ZoneInfo
 
-    from app.services.quota import UTC_ZONE, month_key, resets_on
+    from app.services.quota import month_key, resets_on
+    from app.services.zones import UTC_ZONE
 
     nairobi = ZoneInfo("Africa/Nairobi")
 

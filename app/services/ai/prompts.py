@@ -182,15 +182,20 @@ def build_context_block(context: StudentContext) -> str:
     the screen, it cannot open PDFs. Both were true of the prompt it was given
     and neither was true of the app.
     """
+    lines = _who(context) + _week(context) + _streak(context)
+
     if context.unit_code is None:
-        if not context.other_units:
+        if context.other_units:
+            units = "; ".join(context.other_units)
+            lines.append(
+                "They have no unit open right now. The units they have set up "
+                f"are: {units}. If they ask about one, ask them to open it so "
+                "you can search inside it."
+            )
+        elif not lines:
             return ""
-        units = "; ".join(context.other_units)
-        return (
-            "What you can see about this student: they have no unit open right "
-            f"now. The units they have set up are: {units}. If they ask about "
-            "one, ask them to open it so you can search inside it."
-        )
+        lines.insert(0, "What you can see about this student right now.")
+        return "\n".join(lines)
 
     header = (
         f"{context.unit_code} — {context.unit_title}"
@@ -199,6 +204,7 @@ def build_context_block(context: StudentContext) -> str:
     )
     lines = [
         "What you can see about this student right now.",
+        *lines,
         f"The unit they have open is {header}. Refer to it by that code.",
     ]
 
@@ -220,6 +226,97 @@ def build_context_block(context: StudentContext) -> str:
         )
 
     return "\n".join(lines)
+
+
+def _who(context: StudentContext) -> list[str]:
+    """
+    A sentence naming the person being talked to.
+
+    Worth its dozen tokens: it is the difference between an assistant and a
+    search box, and it stops the tutor opening with "as a student" at someone
+    whose name, course and year are all sitting in the account it was asked
+    about.
+    """
+    if not context.knows_the_student:
+        return []
+
+    who = context.first_name or "This student"
+    year = f"year {context.year_of_study}" if context.year_of_study else ""
+    reading = f"studying {context.programme}" if context.programme else ""
+    where = f"at {context.institution}" if context.institution else ""
+
+    # Space-joined, not comma-joined: any combination of the three has to read
+    # as a sentence, and "Brian, year 3, studying X, at Y" is not one.
+    detail = " ".join(part for part in (year, reading, where) if part)
+    sentence = f"You are talking to {who}" + (f", {detail}." if detail else ".")
+
+    return [
+        sentence,
+        "Use their name when it is natural. Do not open every answer with it.",
+    ]
+
+
+def _week(context: StudentContext) -> list[str]:
+    """
+    The timetable and the deadlines, which are the whole point of asking a
+    tutor that lives inside the app rather than a chatbot in a browser.
+
+    Given as facts and followed by one instruction about restraint, because
+    without it a model handed a deadline mentions the deadline in every answer
+    until the student stops asking.
+    """
+    if not context.has_a_week:
+        return []
+
+    lines = []
+
+    if context.classes_today:
+        listed = ", ".join(slot.describe() for slot in context.classes_today)
+        lines.append(f"Today is {context.today_name}. Their classes today: {listed}.")
+    else:
+        lines.append(f"Today is {context.today_name}. They have no classes today.")
+
+    if context.classes_tomorrow:
+        listed = ", ".join(slot.describe() for slot in context.classes_tomorrow)
+        lines.append(f"Tomorrow: {listed}.")
+
+    if context.deadlines:
+        listed = "; ".join(item.describe() for item in context.deadlines)
+        lines.append(f"What is coming up for them: {listed}.")
+
+    lines.append(
+        "That is their real timetable and their real deadlines. Use it to be "
+        "specific — what to revise first, how much time there is. Do not "
+        "recite it back unless they asked, and never invent an entry that is "
+        "not listed here."
+    )
+    return lines
+
+
+def _streak(context: StudentContext) -> list[str]:
+    """
+    How long they have kept it up, and one firm instruction about restraint.
+
+    The instruction is the larger half. A model handed a number it can praise
+    will praise it in every answer, and a tutor that opens with "eleven days,
+    amazing!" before explaining hydrolysis is the app being pleased with itself
+    at a student who asked a question. Once, at the end, when it fits.
+    """
+    if not context.has_a_streak:
+        return []
+
+    today = (
+        "Today is already counted."
+        if context.studied_today
+        else "Today is not counted yet."
+    )
+
+    return [
+        f"They have revised {context.streak_days} days in a row. {today}",
+        "Mention it only if they bring it up, or once at the end of an answer "
+        "where a word of encouragement genuinely fits. Never open with it, and "
+        "never use it to push them.",
+    ]
 
 
 def system_for(mode: str, context: StudentContext | None = None) -> str:

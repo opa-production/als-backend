@@ -1,5 +1,5 @@
 import uuid
-from datetime import time
+from datetime import date, time
 from typing import TYPE_CHECKING
 
 from sqlalchemy import ForeignKey, Index, SmallInteger, String, Time, UniqueConstraint
@@ -69,5 +69,17 @@ class ClassSession(Base, UUIDPrimaryKey, Timestamps, SoftDelete):
     starts_at: Mapped[time] = mapped_column(Time(timezone=False), nullable=False)
     ends_at: Mapped[time] = mapped_column(Time(timezone=False), nullable=False)
     room: Mapped[str] = mapped_column(String(80), default="")
+
+    @staticmethod
+    def weekday_of(day: date) -> int:
+        """
+        A calendar date as this column numbers it.
+
+        Python counts from Monday and this column counts from Sunday, so the
+        two are never directly comparable. The conversion lives here, next to
+        the column it converts for — written out at each call site it is an
+        off-by-one waiting for the one place somebody forgets.
+        """
+        return (day.weekday() + 1) % 7
 
     __table_args__ = (Index("ix_class_sessions_user_weekday", "user_id", "weekday"),)

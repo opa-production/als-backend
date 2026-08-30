@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -13,8 +13,12 @@ from app.core.clock import as_utc
 from app.core.clock import now as utc_now
 from app.core.errors import QuotaExceeded
 from app.models.billing import Subscription, UsageCounter
-from app.models.settings import UserSettings
 from app.services.plans import UNLIMITED, Tier, limits_for, plan_for, unit_cap
+
+# `user_zone` was defined here until reminders and the tutor needed the same
+# answer. It lives in `zones` now and is imported rather than re-implemented;
+# callers that reach for it through this module still work.
+from app.services.zones import user_zone, zone_for
 
 
 @dataclass(frozen=True)
@@ -53,41 +57,6 @@ class Entitlement:
 # night of the month opens the app after midnight, sees the 1st on their phone
 # and finds nothing has refilled. The 1st has to mean their 1st, so the zone
 # travels with the period key.
-
-UTC_ZONE = ZoneInfo("UTC")
-
-#: Where a student who has never saved a timezone is assumed to be. Read off
-#: the settings column rather than written out again, so the boundary someone
-#: gets before they open Settings is the one they keep afterwards.
-DEFAULT_ZONE_NAME: str = UserSettings.__table__.c.timezone.default.arg
-
-
-def zone_for(name: str | None) -> ZoneInfo:
-    """
-    An IANA name as a zone, falling back rather than failing.
-
-    A name this machine does not know is a bad preference, not an outage, and
-    refusing to serve a quota check over it would lock the student out of the
-    app entirely.
-    """
-    try:
-        return ZoneInfo(name or DEFAULT_ZONE_NAME)
-    except (ZoneInfoNotFoundError, ValueError):
-        return UTC_ZONE
-
-
-async def user_zone(session: AsyncSession, user_id: uuid.UUID) -> ZoneInfo:
-    """
-    The timezone this student's periods roll over in.
-
-    One narrow read of an indexed column, resolved once per entry point and
-    handed down, rather than per counter touched.
-    """
-    name = await session.scalar(
-        select(UserSettings.timezone).where(UserSettings.user_id == user_id)
-    )
-    return zone_for(name)
-
 
 def _local(moment: datetime | None, zone: ZoneInfo | None) -> datetime:
     return (moment or utc_now()).astimezone(zone or zone_for(None))

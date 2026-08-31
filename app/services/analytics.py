@@ -40,7 +40,7 @@ from app.models.billing import (
     UsageCounter,
 )
 from app.models.course import ClassSession, Unit
-from app.models.knowledge import Material, MaterialChunk
+from app.models.knowledge import EXTRACTABLE_KINDS, Material, MaterialChunk
 from app.models.planner import Event
 from app.models.settings import StudyDay
 from app.models.tutor import Chat, Message
@@ -690,7 +690,7 @@ async def ai_health(session: AsyncSession) -> AiHealth:
 
     # `note` and `link` carry their text already and are never extracted, so
     # counting them would dilute coverage with documents that need no work.
-    extractable_filter = (live, Material.kind.in_(("pdf", "image")))
+    extractable_filter = (live, Material.kind.in_(EXTRACTABLE_KINDS))
 
     extractable = await count_rows(session, Material, *extractable_filter)
     extracted = await count_rows(

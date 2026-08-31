@@ -7,7 +7,7 @@ from sqlalchemy import select
 from app.api.deps import CurrentUser, DbSession, HttpClient
 from app.core.errors import AppError, NotFound
 from app.models.course import Unit
-from app.models.knowledge import Material
+from app.models.knowledge import EXTRACTABLE_KINDS, Material
 from app.services.quota import check_file_size, get_entitlement
 from app.services.storage import (
     ALLOWED_MIME,
@@ -26,7 +26,10 @@ class UploadUrlRequest(BaseModel):
     #: a retried upload overwrites rather than duplicating.
     material_id: uuid.UUID
     unit_id: uuid.UUID
-    kind: str = Field(pattern="^(pdf|image)$")
+    #: Built from the tuple the extraction queue selects on, not written out
+    #: again. The two were separate lists once, and the day they disagreed every
+    #: uploaded photo became a row nothing would ever read.
+    kind: str = Field(pattern=f"^({'|'.join(EXTRACTABLE_KINDS)})$")
     filename: str = Field(max_length=255)
     mime_type: str = Field(max_length=128)
     byte_size: int = Field(gt=0)

@@ -39,8 +39,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.clock import now as utc_now
 from app.core.errors import QuotaExceeded
-from app.models.knowledge import Material, MaterialChunk
-from app.services.quota import check_pdf_pages, get_entitlement, record_pdf_pages
+from app.models.knowledge import EXTRACTABLE_KINDS, Material, MaterialChunk
+from app.services.ai import ocr
+from app.services.quota import (
+    check_ocr,
+    check_pdf_pages,
+    get_entitlement,
+    record_pdf_pages,
+    record_usage,
+)
 from app.services.storage import Bucket, StorageError, SupabaseStorage
 
 log = structlog.get_logger()
@@ -251,11 +258,17 @@ async def extract_material(
     await session.commit()
 
     try:
-        data = await _download(material, client)
-        extracted = await asyncio.to_thread(_read_pdf, data)
-
         entitlement = await get_entitlement(session, material.user_id)
-        # After extraction, because until now nobody knew the page count — and
+        data = await _download(material, client)
+
+        if material.kind == "image":
+            extracted = await _read_scan(
+                session, material, data, entitlement=entitlement, client=client
+            )
+        else:
+            extracted = await asyncio.to_thread(_read_pdf, data)
+
+        # After reading, because until now nobody knew the page count — and
         # before writing anything, because a document over the limit should
         # leave no trace in the index.
         await check_pdf_pages(session, material.user_id, entitlement, extracted.page_count)
@@ -267,11 +280,19 @@ async def extract_material(
         material.extraction_status = "done"
         material.extraction_error = None
         await record_pdf_pages(session, material.user_id, extracted.page_count)
+        if material.kind == "image":
+            # Spent only now, on the way out. A scan that failed to read, or one
+            # refused by a page limit after the fact, must not come out of an
+            # allowance the student got nothing for.
+            await record_usage(
+                session, material.user_id, "ocr_pages", extracted.page_count
+            )
         await session.commit()
 
         log.info(
             "extraction_done",
             material_id=str(material_id),
+            kind=material.kind,
             pages=extracted.page_count,
             text_pages=extracted.text_pages,
             chunks=len(chunks),
@@ -284,15 +305,61 @@ async def extract_material(
         # broken", which need completely different responses.
         return await _fail(session, material, error.message, status="skipped")
 
+    except ocr.OcrError as error:
+        # Something about this photo, and something the student can act on:
+        # wrong format, out of focus, nothing on the page.
+        return await _fail(session, material, str(error))
+
     except ExtractionError as error:
         return await _fail(session, material, str(error))
 
     except StorageError as error:
         return await _fail(session, material, str(error))
 
+    except httpx.HTTPError as error:
+        # The provider is unreachable or rate-limiting us. Nothing is wrong with
+        # the file, so it goes back on the queue rather than being marked failed
+        # — a five minute outage must not permanently reject an afternoon's
+        # uploads with an error the student cannot do anything about.
+        log.warning(
+            "extraction_requeue_after_provider_error",
+            material_id=str(material_id),
+            error=str(error),
+        )
+        material.extraction_status = "pending"
+        await session.commit()
+        return "pending"
+
     except Exception:  # noqa: BLE001
         log.exception("extraction_crashed", material_id=str(material_id))
         return await _fail(session, material, "Something went wrong reading that file.")
+
+
+async def _read_scan(
+    session: AsyncSession,
+    material: Material,
+    data: bytes,
+    *,
+    entitlement,
+    client: httpx.AsyncClient,
+) -> Extracted:
+    """
+    A photograph of a page, as one page of text.
+
+    The allowance is checked *before* the vision call and spent after the whole
+    job succeeds. Checking first is what stops a student who is over their limit
+    costing us a request anyway; spending last is what stops a scan that could
+    not be read costing them a page they got nothing for.
+
+    Page 1, always. A photo is one page, and giving it a page number at all is
+    what lets the tutor cite it the same way it cites a PDF — "your notes, page
+    1 of Lecture 4" rather than an unattributed quotation.
+    """
+    await check_ocr(session, material.user_id, entitlement, ocr.PAGES_PER_IMAGE)
+
+    scanned = await ocr.read_image(data, mime_type=material.mime_type, client=client)
+
+    return Extracted(page_count=scanned.pages, pages=[(1, _tidy(scanned.text))])
 
 
 async def _download(material: Material, client: httpx.AsyncClient) -> bytes:
@@ -362,6 +429,22 @@ async def _fail(
 # --- The queue ----------------------------------------------------------------
 
 
+def runnable_kinds() -> tuple[str, ...]:
+    """
+    What this worker can actually read right now.
+
+    Every extractable kind, minus scans when there is no vision key set. A
+    scan the box cannot read is left `pending` rather than claimed and failed:
+    the file is fine, the configuration is not, and marking a student's photo
+    as broken because of our environment is a lie that also loses the work —
+    a failed row is never retried, so it would stay wrong after the key was
+    added.
+    """
+    if ocr.configured():
+        return EXTRACTABLE_KINDS
+    return tuple(kind for kind in EXTRACTABLE_KINDS if kind != "image")
+
+
 async def claim_batch(session: AsyncSession, limit: int) -> list[uuid.UUID]:
     """
     The next materials to read, oldest first.
@@ -375,7 +458,11 @@ async def claim_batch(session: AsyncSession, limit: int) -> list[uuid.UUID]:
         .where(
             Material.extraction_status == "pending",
             Material.deleted_at.is_(None),
-            Material.kind.in_(("pdf",)),
+            # Derived from the same tuple the upload endpoint validates
+            # against. Written out separately here once, and every scan a
+            # student uploaded sat `pending` for ever because nothing claimed
+            # it — see `EXTRACTABLE_KINDS`.
+            Material.kind.in_(runnable_kinds()),
         )
         .order_by(Material.created_at)
         .limit(limit)

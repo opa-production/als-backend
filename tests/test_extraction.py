@@ -18,6 +18,7 @@ What is worth pinning:
 
 import io
 import itertools
+import json
 import uuid
 
 import httpx
@@ -27,6 +28,7 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.models.course import Unit
 from app.models.knowledge import Material, MaterialChunk
+from app.services.ai import ocr
 from app.services.plans import Tier
 from app.workers import extraction
 from tests.conftest import sign_in
@@ -447,3 +449,339 @@ async def test_a_worker_still_running_is_left_alone(client):
 
     async with client.sessions() as session:
         assert await extraction.requeue_stalled(session) == 0
+
+
+# --- Scans --------------------------------------------------------------------
+#
+# The path that did not exist. `allow_ocr_scans` and `monthly_ocr_page_limit`
+# were on the pricing card and `check_ocr` was written and waiting, but nothing
+# ever looked at an image — and because the queue selected only PDFs while the
+# upload endpoint accepted images, every photo a student uploaded sat in
+# `pending` for ever. No error, no log, no retry: the app showed "reading your
+# notes" and meant it literally.
+
+
+TRANSCRIPT = (
+    "Deadlock requires four conditions holding at once: mutual exclusion, "
+    "hold and wait, no preemption, and circular wait. Breaking any one of "
+    "them is enough to prevent it."
+)
+
+
+def _scan_client(
+    *, transcript: str = TRANSCRIPT, status: int = 200, image: bytes = b"\xff\xd8jpeg"
+) -> httpx.AsyncClient:
+    """
+    Storage and the vision model, both mocked at the transport.
+
+    Mocked here rather than at `ocr.read_image` so the real request is built and
+    the real response parsed — the data URI, the message shape and the choices
+    unwrapping are the parts most likely to be wrong, and stubbing the function
+    would test none of them.
+    """
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        # Matched on the endpoint shape, not a hostname: `OCR_BASE_URL` is
+        # configuration, and a test that pins one provider's domain would go
+        # red the day someone points it at another.
+        if url.endswith("/chat/completions"):
+            if status >= 400:
+                return httpx.Response(status, json={"error": {"message": "no"}})
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": transcript}}],
+                    "usage": {"prompt_tokens": 800, "completion_tokens": 60},
+                },
+            )
+        if "/object/sign/" in url:
+            return httpx.Response(200, json={"signedURL": "/object/signed/photo.jpg"})
+        return httpx.Response(200, content=image)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handle))
+
+
+async def _scan(client, user_id, *, mime="image/jpeg"):
+    material_id = await _material(client, user_id, kind="image", path="u/m/photo.jpg")
+    async with client.sessions() as session:
+        material = await session.get(Material, material_id)
+        material.storage_bucket = "scans"
+        material.mime_type = mime
+        await session.commit()
+    return material_id
+
+
+async def _give(client, user_id, tier):
+    from app.services.billing import activate
+
+    async with client.sessions() as session:
+        await activate(session, user_id=user_id, tier=tier, verified=True)
+        await session.commit()
+
+
+@pytest.fixture
+def ocr_configured(monkeypatch):
+    monkeypatch.setattr(settings, "google_api_key", "test-key")
+    monkeypatch.setattr(settings, "ocr_api_key", "")
+
+
+async def test_every_kind_the_api_accepts_is_a_kind_the_queue_claims(
+    client, ocr_configured
+):
+    """
+    The invariant behind the original bug.
+
+    The upload endpoint accepted images; the queue claimed only PDFs. Neither
+    line was wrong on its own, nothing raised, and the row was simply
+    unreachable for ever. A material the API will create must be a material the
+    worker will pick up.
+    """
+    from app.api.v1.routes.materials import UploadUrlRequest
+    from app.models.knowledge import EXTRACTABLE_KINDS
+
+    accepted = UploadUrlRequest.model_fields["kind"].metadata[0].pattern
+    for kind in EXTRACTABLE_KINDS:
+        assert kind in accepted
+
+    _, user_id = await sign_in(client)
+    ids = {}
+    for kind in EXTRACTABLE_KINDS:
+        ids[kind] = await _material(client, user_id, kind=kind, path=f"u/m/f.{kind}")
+
+    async with client.sessions() as session:
+        claimed = set(await extraction.claim_batch(session, 50))
+
+    for kind, material_id in ids.items():
+        assert material_id in claimed, f"{kind} is accepted but never claimed"
+
+
+async def test_a_photo_of_notes_becomes_searchable_text(client, ocr_configured):
+    _, user_id = await sign_in(client)
+    await _give(client, user_id, Tier.PRO)
+    material_id = await _scan(client, user_id)
+
+    async with client.sessions() as session, _scan_client() as http:
+        status = await extraction.extract_material(session, material_id, client=http)
+
+    assert status == "done"
+
+    async with client.sessions() as session:
+        material = await session.get(Material, material_id)
+        chunks = (
+            await session.scalars(
+                select(MaterialChunk).where(MaterialChunk.material_id == material_id)
+            )
+        ).all()
+
+    assert material.extraction_status == "done"
+    assert material.extraction_error is None
+    # One photograph is one page, and it carries a page number so the tutor can
+    # cite it the same way it cites a PDF.
+    assert material.page_count == 1
+    assert chunks and chunks[0].page_number == 1
+    assert "circular wait" in chunks[0].content
+
+
+async def test_a_scan_on_a_plan_without_ocr_is_skipped_not_failed(client, ocr_configured):
+    """
+    The file is fine; the allowance is not. The console has to tell those apart,
+    and the student has to be told which one it was.
+    """
+    _, user_id = await sign_in(client)  # Free.
+    material_id = await _scan(client, user_id)
+
+    async with client.sessions() as session, _scan_client() as http:
+        status = await extraction.extract_material(session, material_id, client=http)
+
+    assert status == "skipped"
+
+    async with client.sessions() as session:
+        material = await session.get(Material, material_id)
+
+    assert "Synapse" in material.extraction_error
+
+
+async def test_the_allowance_is_not_spent_on_a_photo_that_could_not_be_read(
+    client, ocr_configured
+):
+    """
+    Checked before the vision call, spent after the whole job succeeds.
+
+    A student whose photo came out blurred must not lose a page of their monthly
+    thirty for a transcription they never received.
+    """
+    from app.services.quota import current_usage
+
+    _, user_id = await sign_in(client)
+    await _give(client, user_id, Tier.PRO)
+    material_id = await _scan(client, user_id)
+
+    async with client.sessions() as session, _scan_client(transcript="NO_TEXT") as http:
+        status = await extraction.extract_material(session, material_id, client=http)
+
+    assert status == "failed"
+
+    async with client.sessions() as session:
+        material = await session.get(Material, material_id)
+        spent = await current_usage(session, user_id, "ocr_pages")
+
+    assert spent == 0
+    assert "in focus" in material.extraction_error
+
+
+async def test_a_successful_scan_does_spend_the_allowance(client, ocr_configured):
+    from app.services.quota import current_usage
+
+    _, user_id = await sign_in(client)
+    await _give(client, user_id, Tier.PRO)
+    material_id = await _scan(client, user_id)
+
+    async with client.sessions() as session, _scan_client() as http:
+        await extraction.extract_material(session, material_id, client=http)
+
+    async with client.sessions() as session:
+        assert await current_usage(session, user_id, "ocr_pages") == 1
+
+
+async def test_heic_is_refused_with_something_a_student_can_do(client, ocr_configured):
+    """
+    iPhones shoot HEIC by default and the vision API will not read it.
+
+    Refused before the request, naming the actual setting to change — not sent
+    and failed as an opaque provider error.
+    """
+    _, user_id = await sign_in(client)
+    await _give(client, user_id, Tier.PRO)
+    material_id = await _scan(client, user_id, mime="image/heic")
+
+    async with client.sessions() as session, _scan_client() as http:
+        status = await extraction.extract_material(session, material_id, client=http)
+
+    assert status == "failed"
+
+    async with client.sessions() as session:
+        material = await session.get(Material, material_id)
+
+    assert "Most Compatible" in material.extraction_error
+
+
+async def test_scans_wait_rather_than_fail_when_ocr_is_not_configured(client, monkeypatch):
+    """
+    A missing key is our problem, not the file's.
+
+    `failed` is terminal — the queue only looks at `pending` — so marking a
+    perfectly good photo as broken because the box had no vision key would leave
+    it wrong for ever after the key was added.
+    """
+    monkeypatch.setattr(settings, "google_api_key", "")
+    monkeypatch.setattr(settings, "ocr_api_key", "")
+
+    _, user_id = await sign_in(client)
+    pdf_id = await _material(client, user_id)
+    scan_id = await _scan(client, user_id)
+
+    async with client.sessions() as session:
+        claimed = await extraction.claim_batch(session, 10)
+
+    assert pdf_id in claimed
+    assert scan_id not in claimed
+
+    # And it is still there, waiting, once a key is set.
+    monkeypatch.setattr(settings, "google_api_key", "test-key")
+    async with client.sessions() as session:
+        assert scan_id in await extraction.claim_batch(session, 10)
+
+
+async def test_a_provider_outage_requeues_instead_of_rejecting(client, ocr_configured):
+    """
+    A five minute outage must not permanently reject an afternoon of uploads
+    with an error the student cannot act on.
+    """
+    _, user_id = await sign_in(client)
+    await _give(client, user_id, Tier.PRO)
+    material_id = await _scan(client, user_id)
+
+    async with client.sessions() as session, _scan_client(status=429) as http:
+        status = await extraction.extract_material(session, material_id, client=http)
+
+    assert status == "pending"
+
+    async with client.sessions() as session:
+        material = await session.get(Material, material_id)
+        assert material.extraction_status == "pending"
+        # Back on the queue, not lost.
+        assert material_id in await extraction.claim_batch(session, 10)
+
+
+async def test_the_scan_request_goes_where_the_config_points(client, monkeypatch):
+    """
+    The provider is `OCR_BASE_URL`, not a hostname baked into the module.
+
+    Worth pinning because getting it wrong is silent in exactly the way the
+    original bug was: the request goes somewhere plausible, fails with a 401,
+    and every scan is marked failed for a reason that has nothing to do with the
+    student's photo.
+    """
+    monkeypatch.setattr(settings, "ocr_base_url", "https://elsewhere.test/v1/")
+    monkeypatch.setattr(settings, "ocr_api_key", "explicit-key")
+    monkeypatch.setattr(settings, "google_api_key", "should-not-be-used")
+    monkeypatch.setattr(settings, "ocr_model", "some-vision-model")
+
+    _, user_id = await sign_in(client)
+    await _give(client, user_id, Tier.PRO)
+    material_id = await _scan(client, user_id)
+
+    seen = {}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/chat/completions"):
+            seen["url"] = url
+            seen["auth"] = request.headers.get("authorization")
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": TRANSCRIPT}}]}
+            )
+        if "/object/sign/" in url:
+            return httpx.Response(200, json={"signedURL": "/object/signed/photo.jpg"})
+        return httpx.Response(200, content=b"\xff\xd8jpeg")
+
+    async with (
+        client.sessions() as session,
+        httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http,
+    ):
+        status = await extraction.extract_material(session, material_id, client=http)
+
+    assert status == "done"
+    # The trailing slash on the base URL must not become a double slash.
+    assert seen["url"] == "https://elsewhere.test/v1/chat/completions"
+    # OCR_API_KEY wins over GOOGLE_API_KEY when both are set.
+    assert seen["auth"] == "Bearer explicit-key"
+    assert seen["body"]["model"] == "some-vision-model"
+
+    # The image travels as a data URI carrying the material's own mime type —
+    # send the wrong one and providers reject the whole request.
+    parts = seen["body"]["messages"][0]["content"]
+    image = next(part for part in parts if part["type"] == "image_url")
+    assert image["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+async def test_the_google_key_is_enough_on_its_own(client, monkeypatch):
+    """
+    The ordinary deployment sets one key. Asking for the same value in two
+    variables is a way to have them disagree later.
+    """
+    monkeypatch.setattr(settings, "ocr_api_key", "")
+    monkeypatch.setattr(settings, "google_api_key", "gemini-key")
+
+    assert ocr.configured()
+
+    _, user_id = await sign_in(client)
+    await _give(client, user_id, Tier.PRO)
+    material_id = await _scan(client, user_id)
+
+    async with client.sessions() as session, _scan_client() as http:
+        assert (
+            await extraction.extract_material(session, material_id, client=http)
+        ) == "done"

@@ -345,6 +345,12 @@ def _specs() -> list[ModelSpec]:
             implemented=False,
             note="The Anthropic adapter is not written yet.",
         ),
+        # Not selectable as a *tutor* yet — that needs streaming, and Gemini's
+        # native streaming events are a different shape from the SSE this module
+        # parses. It is already the default for OCR, which goes through Google's
+        # OpenAI-compatible endpoint and needs no streaming at all
+        # (`app/services/ai/ocr.py`). The two are not in conflict: reading one
+        # photograph is a single request, answering a student is not.
         ModelSpec(
             id="gemini-2.5-flash",
             provider="google",
@@ -352,7 +358,7 @@ def _specs() -> list[ModelSpec]:
             description="Fast, and handles very long documents.",
             available=False,
             implemented=False,
-            note="The Gemini adapter is not written yet.",
+            note="The Gemini tutor adapter is not written yet. Scans already use it.",
         ),
     ]
 

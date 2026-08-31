@@ -5,6 +5,28 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, SoftDelete, Timestamps, UuidPK, UUIDPrimaryKey
 
+#: Everything a material can be.
+#:
+#: ``note`` is text the student typed and ``link`` is a URL — neither has a file
+#: and neither needs reading. ``pdf`` and ``image`` do.
+MATERIAL_KINDS = ("note", "pdf", "image", "link")
+
+#: The kinds that arrive as a file and have to be read before the tutor can
+#: quote them.
+#:
+#: **This tuple is the contract between the upload endpoint and the extraction
+#: queue, and it exists because they once disagreed.** ``/materials/upload-url``
+#: accepted ``image`` and wrote the row as ``pending``; ``claim_batch`` selected
+#: ``kind IN ('pdf')``. Nothing was wrong with either line on its own, so nothing
+#: failed and nothing logged — every photo a student uploaded simply sat in
+#: ``pending`` for ever, and the app, which has no way to tell "queued" from
+#: "abandoned", showed "reading your notes" until the end of time.
+#:
+#: One tuple, imported by both, and `test_extraction.py` asserts that every kind
+#: the API accepts is a kind the queue will claim. A row that nothing will ever
+#: pick up should not be constructible.
+EXTRACTABLE_KINDS = ("pdf", "image")
+
 
 class Material(Base, UUIDPrimaryKey, Timestamps, SoftDelete):
     """
@@ -25,7 +47,8 @@ class Material(Base, UUIDPrimaryKey, Timestamps, SoftDelete):
         ForeignKey("units.id", ondelete="CASCADE"), index=True, nullable=False
     )
 
-    #: note | pdf | image | link
+    #: One of `MATERIAL_KINDS`. Not a database enum: adding a kind would then
+    #: be a migration, and the values are validated where they enter.
     kind: Mapped[str] = mapped_column(String(16), nullable=False, default="note")
     title: Mapped[str] = mapped_column(String(300), nullable=False)
 

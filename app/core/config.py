@@ -258,6 +258,41 @@ class Settings(BaseSettings):
     #: What a student gets when they express no preference.
     ai_default_model: str = "deepseek-chat"
 
+    # --- Reading photographs of pages -------------------------------------
+    #
+    # Chosen independently of `ai_default_model`, because the tutor's default is
+    # DeepSeek and DeepSeek cannot see. OCR needs a model with vision whatever
+    # the tutor is set to.
+    #
+    # Gemini by default: on a per-image basis it is the cheapest thing that
+    # reads handwriting well, and the free tier covers a small cohort outright.
+
+    #: Any endpoint speaking the OpenAI `/chat/completions` shape. Google,
+    #: OpenRouter, Groq, Together and OpenAI itself all do, which is why this is
+    #: a URL rather than a provider name — switching is an environment variable,
+    #: not a new adapter.
+    ocr_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
+    ocr_model: str = "gemini-2.5-flash"
+
+    #: Blank means "use `GOOGLE_API_KEY`" — see `ocr_key`.
+    ocr_api_key: str = ""
+
+    @property
+    def ocr_key(self) -> str:
+        """
+        What OCR authenticates with.
+
+        `OCR_API_KEY` wins, so a deployment can point scans at one provider and
+        the tutor at another. It falls back to `GOOGLE_API_KEY` because that is
+        the ordinary case — the default base URL is Google's, and asking someone
+        to paste one key into two variables is a way to have them disagree
+        later.
+
+        Point `OCR_BASE_URL` at anything else and `OCR_API_KEY` becomes
+        required: there is deliberately no guessing from the hostname.
+        """
+        return self.ocr_api_key or self.google_api_key
+
     #: Long enough for a full explanation, short enough that a runaway
     #: generation cannot bill for a novel.
     ai_max_output_tokens: int = 900

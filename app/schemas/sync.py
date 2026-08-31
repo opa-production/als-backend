@@ -145,6 +145,17 @@ class MaterialOut(MaterialIn):
     storage_path: str | None = None
     page_count: int | None = None
     extraction_status: str = "pending"
+    #: Why it failed, in words meant for the student.
+    #:
+    #: Server-authored and read-only — it is absent from `MaterialIn`, so a
+    #: device cannot write one, and sync never copies it back.
+    #:
+    #: Without this the app received `failed` and nothing else, and a card that
+    #: renders anything other than `done` as "still reading" showed a permanent
+    #: spinner over a document that had already been rejected with a perfectly
+    #: good explanation — "it looks like a scan", "that PDF is password
+    #: protected" — sitting unread in a column.
+    extraction_error: str | None = None
 
 
 class EventOut(EventIn):

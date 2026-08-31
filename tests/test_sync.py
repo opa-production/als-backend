@@ -9,6 +9,7 @@ edit does not raise, it just quietly ruins someone's semester.
 import uuid
 from datetime import UTC, datetime, timedelta
 
+from app.models.knowledge import Material
 from app.services.plans import UNIT_HARD_CAP, Tier
 from tests.conftest import OTHER_PHONE, give_plan, sign_in
 
@@ -370,3 +371,87 @@ async def test_a_long_title_is_clipped_rather_than_failing_the_whole_push(client
     materials = (await client.get("/api/v1/sync", headers=headers)).json()["materials"]
     assert len(materials) == 1
     assert materials[0]["title"] == "A" * 300
+
+
+async def test_a_failed_extraction_reaches_the_device_with_its_reason(client):
+    """
+    The device only ever learns about extraction through a pull — there is no
+    status endpoint to poll, and `/materials/complete` answers once and never
+    again.
+
+    So a status with no reason attached is a card that can only say "not done".
+    An app that renders anything other than `done` as "still reading" then shows
+    a permanent spinner over a document that was rejected minutes ago with a
+    perfectly good explanation sitting unread in a column.
+    """
+    headers, user_id = await sign_in(client)
+    now = datetime.now(UTC)
+
+    unit_id = uuid.uuid4()
+    await client.post(
+        "/api/v1/sync",
+        json={"units": [_unit(unit_id, updated=now)]},
+        headers=headers,
+    )
+
+    material_id = uuid.uuid4()
+    async with client.sessions() as session:
+        session.add(
+            Material(
+                id=material_id,
+                user_id=user_id,
+                unit_id=unit_id,
+                kind="pdf",
+                title="Lecture 4",
+                extraction_status="failed",
+                extraction_error="That PDF is password protected.",
+            )
+        )
+        await session.commit()
+
+    pulled = (await client.get("/api/v1/sync", headers=headers)).json()
+    material = next(row for row in pulled["materials"] if row["id"] == str(material_id))
+
+    assert material["extraction_status"] == "failed"
+    assert material["extraction_error"] == "That PDF is password protected."
+
+
+async def test_a_device_cannot_write_an_extraction_result(client):
+    """
+    Status and error are the server's to set. A device claiming `done` would be
+    claiming its file had been read and indexed, which would make the tutor
+    answer from a document it has never seen.
+    """
+    headers, user_id = await sign_in(client)
+    now = datetime.now(UTC)
+
+    unit_id = uuid.uuid4()
+    material_id = uuid.uuid4()
+
+    await client.post(
+        "/api/v1/sync",
+        json={
+            "units": [_unit(unit_id, updated=now)],
+            "materials": [
+                {
+                    "id": str(material_id),
+                    "unit_id": str(unit_id),
+                    "kind": "pdf",
+                    "title": "Lecture 4",
+                    "body": "",
+                    "archived": False,
+                    "updated_at": now.isoformat(),
+                    "deleted_at": None,
+                    # Both ignored: neither is a field sync copies.
+                    "extraction_status": "done",
+                    "extraction_error": "",
+                }
+            ],
+        },
+        headers=headers,
+    )
+
+    async with client.sessions() as session:
+        material = await session.get(Material, material_id)
+
+    assert material.extraction_status == "pending"

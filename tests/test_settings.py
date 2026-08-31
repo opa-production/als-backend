@@ -9,6 +9,7 @@ a counter would quietly get wrong.
 import uuid
 from datetime import date, timedelta
 
+from app.services.plans import UNIT_HARD_CAP
 from app.services.streak import compute, record_day
 from tests.conftest import sign_in
 
@@ -286,7 +287,17 @@ async def test_usage_reports_the_free_meters(client):
     assert meter["resets_at"].endswith("-01")
     # A lifetime ceiling is not a reset, and must not be drawn as one.
     assert body["ai_queries_total"]["resets_at"] is None
-    assert body["course_units"]["limit"] == 2
+    # The same ceiling on every tier, and never a countdown: no plan lifts it
+    # and nothing about it refills.
+    assert body["course_units"]["limit"] == UNIT_HARD_CAP
+    assert body["course_units"]["unlimited"] is False
+    assert body["course_units"]["resets_at"] is None
+    # The page pool is the meter that now bounds a free account's filing. Both
+    # figures are 100 on Free, and only the monthly one carries a reset date.
+    assert body["pdf_pages_this_month"]["limit"] == 100
+    assert body["pdf_pages_this_month"]["resets_at"].endswith("-01")
+    assert body["pdf_pages_total"]["limit"] == 100
+    assert body["pdf_pages_total"]["resets_at"] is None
     # No OCR on free, so the meter is a zero ceiling rather than a lie.
     assert body["ocr_pages_this_month"]["limit"] == 0
 

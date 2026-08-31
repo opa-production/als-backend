@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,7 +13,7 @@ from app.core.clock import as_utc
 from app.core.clock import now as utc_now
 from app.core.errors import QuotaExceeded
 from app.models.billing import Subscription, UsageCounter
-from app.services.plans import UNLIMITED, Tier, limits_for, plan_for, unit_cap
+from app.services.plans import UNLIMITED, Tier, limits_for, plan_for
 
 # `user_zone` was defined here until reminders and the tutor needed the same
 # answer. It lives in `zones` now and is imported rather than re-implemented;
@@ -85,7 +85,11 @@ METRIC_PERIODS = {
     "quizzes_monthly": month_key,
     "quizzes_lifetime": _lifetime,
     "ocr_pages": month_key,
-    "pdf_pages": _lifetime,
+    #: Monthly on every paid tier, with a lifetime companion that only Free
+    #: sets a ceiling against — the same two-meter shape as ``ai_queries``,
+    #: for the same reason. See ``Limits.total_pdf_pages_pool``.
+    "pdf_pages": month_key,
+    "pdf_pages_lifetime": _lifetime,
 }
 
 
@@ -288,25 +292,6 @@ async def record_usage(
 # you pay for", not "too fast", and the app shows a different screen for each.
 
 
-async def check_unit_cap(
-    session: AsyncSession, user_id: uuid.UUID, entitlement: Entitlement
-) -> None:
-    from app.models.course import Unit
-
-    cap = unit_cap(entitlement.tier)
-    used = await session.scalar(
-        select(func.count())
-        .select_from(Unit)
-        .where(Unit.user_id == user_id, Unit.deleted_at.is_(None))
-    )
-
-    if (used or 0) >= cap:
-        raise QuotaExceeded(
-            f"{plan_for(entitlement.tier).name} covers {cap} course "
-            f"{'unit' if cap == 1 else 'units'}."
-        )
-
-
 async def check_ai_query(
     session: AsyncSession, user_id: uuid.UUID, entitlement: Entitlement
 ) -> None:
@@ -415,13 +400,20 @@ async def check_pdf_pages(
     pages: int,
 ) -> None:
     """
-    The per-file and total page limits, at last enforceable.
+    The per-file and pool page limits, at last enforceable.
 
-    Neither can be checked on the device — nothing there can open a PDF — so
-    both are advertised on the pricing card and unchecked in the app. This runs
-    after extraction, when the real page count is finally known.
+    None of them can be checked on the device — nothing there can open a PDF —
+    so all are advertised on the pricing card and unchecked in the app. This
+    runs after extraction, when the real page count is finally known.
+
+    Two pools, in the order the messages have to be read. The lifetime one is
+    the end of the free plan and never comes back; the monthly one refills on
+    the 1st. Telling someone to wait for a reset that is not coming is worse
+    than telling them the truth, so the lifetime ceiling is tested first — the
+    same ordering, and the same reason, as ``check_ai_query``.
     """
     limits = entitlement.limits
+    zone = await user_zone(session, user_id)
 
     if pages > limits.max_single_file_pages:
         raise QuotaExceeded(
@@ -429,13 +421,43 @@ async def check_pdf_pages(
             f"{limits.max_single_file_pages} pages. That one has {pages}."
         )
 
-    used = await current_usage(session, user_id, "pdf_pages")
+    if limits.lifetime_pdf_pages != UNLIMITED:
+        spent = await current_usage(session, user_id, "pdf_pages_lifetime", zone)
+        if spent + pages > limits.lifetime_pdf_pages:
+            remaining = max(0, limits.lifetime_pdf_pages - spent)
+            raise QuotaExceeded(
+                f"That would use {pages} pages and you have {remaining} left of "
+                f"the {limits.lifetime_pdf_pages} the free plan includes. "
+                "A paid plan carries on from here."
+            )
+
+    used = await current_usage(session, user_id, "pdf_pages", zone)
     if used + pages > limits.total_pdf_pages_pool:
         remaining = max(0, limits.total_pdf_pages_pool - used)
         raise QuotaExceeded(
             f"That would use {pages} pages and you have {remaining} left of "
-            f"{limits.total_pdf_pages_pool}."
+            f"this month's {limits.total_pdf_pages_pool}. They refill on the 1st."
         )
+
+
+async def record_pdf_pages(
+    session: AsyncSession, user_id: uuid.UUID, pages: int
+) -> None:
+    """
+    Spends pages against both meters.
+
+    One call rather than two at the call site, for the reason spelled out on
+    ``record_ai_query``: the lifetime counter is the easy one to forget, and
+    forgetting it is silent — the monthly pool still works, so nothing looks
+    broken while the ceiling that bounds a never-converting account quietly
+    does not exist.
+
+    Kept for every tier, not only Free, so a student who pays, lapses and lands
+    back on Free is measured from where they actually got to.
+    """
+    zone = await user_zone(session, user_id)
+    await record_usage(session, user_id, "pdf_pages", pages, zone=zone)
+    await record_usage(session, user_id, "pdf_pages_lifetime", pages, zone=zone)
 
 
 async def check_ocr(

@@ -14,7 +14,7 @@ from app.models.settings import UserSettings
 from app.services import notifications as notification_service
 from app.services import referrals
 from app.services import streak as streak_service
-from app.services.plans import UNLIMITED, plan_for
+from app.services.plans import UNLIMITED, plan_for, unit_cap
 from app.services.quota import (
     current_usage,
     get_entitlement,
@@ -372,7 +372,15 @@ class UsageOut(BaseModel):
     ai_queries_total: MeterOut
     quizzes: MeterOut
     quiz_interval: str
+    #: The same ceiling on every tier. Drawn as a standing cap, never as
+    #: something a plan lifts — no plan does.
     course_units: MeterOut
+    #: Pages extracted this month. On a paid plan this is the meter that bounds
+    #: how much material can be filed, and it refills on the 1st.
+    pdf_pages_this_month: MeterOut
+    #: Only meaningful where the plan sets a lifetime ceiling — Free. Elsewhere
+    #: it reports as unlimited and the app should not draw a bar for it.
+    pdf_pages_total: MeterOut
     ocr_pages_this_month: MeterOut
 
 
@@ -433,7 +441,28 @@ async def read_usage(user: CurrentUser, session: DbSession) -> UsageOut:
         quiz_interval=limits.quiz_interval,
         # Units are a standing cap, not a meter that refills, so nothing here
         # rolls over and `resets_at` is deliberately absent.
-        course_units=meter(units_used, limits.max_course_units, "pdf_pages"),
+        #
+        # Built by hand rather than through `meter()`. That helper derives the
+        # reset date from a metric name, and this bar has no metric — it used
+        # to borrow "pdf_pages" purely because that key happened to be a
+        # lifetime one. It is monthly now, so borrowing it would have quietly
+        # started drawing a countdown to a refill that never happens.
+        course_units=MeterOut(
+            used=units_used,
+            limit=unit_cap(),
+            unlimited=False,
+            resets_at=None,
+        ),
+        pdf_pages_this_month=meter(
+            await current_usage(session, user.id, "pdf_pages", zone),
+            limits.total_pdf_pages_pool,
+            "pdf_pages",
+        ),
+        pdf_pages_total=meter(
+            await current_usage(session, user.id, "pdf_pages_lifetime", zone),
+            limits.lifetime_pdf_pages,
+            "pdf_pages_lifetime",
+        ),
         ocr_pages_this_month=meter(
             await current_usage(session, user.id, "ocr_pages", zone),
             limits.monthly_ocr_page_limit if limits.allow_ocr_scans else 0,

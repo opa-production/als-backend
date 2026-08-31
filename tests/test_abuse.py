@@ -18,11 +18,13 @@ from app.models.account import User
 from app.models.billing import Subscription
 from app.models.settings import UserSettings
 from app.services.billing import activate, assert_charge_belongs_to
-from app.services.plans import Tier, plan_for
+from app.services.plans import UNIT_HARD_CAP, UNLIMITED, Tier, limits_for, plan_for, unit_cap
 from app.services.quota import (
+    METRIC_PERIODS,
     check_ai_query,
     get_entitlement,
     record_usage,
+    resets_on,
     user_zone,
 )
 from tests.conftest import OTHER_PHONE, PHONE, give_plan, sign_in
@@ -69,8 +71,13 @@ async def test_deleting_and_signing_back_in_gains_nothing(client):
 
 async def test_free_is_a_demonstration_not_a_product(client):
     """
-    Two units and thirty questions a month. Enough to see whether the tutor
-    answers from your own notes; not enough to revise a semester on.
+    Thirty questions a month and a hundred pages that never come back. Enough
+    to see whether the tutor answers from your own notes; not enough to revise
+    a semester on.
+
+    Units are deliberately absent. A free student files their whole timetable
+    like anyone else -- the demonstration is bounded by what costs us money,
+    which is pages extracted and questions answered.
     """
     _, user_id = await sign_in(client)
 
@@ -78,9 +85,40 @@ async def test_free_is_a_demonstration_not_a_product(client):
         entitlement = await get_entitlement(session, user_id)
 
     assert entitlement.tier is Tier.FREE
-    assert entitlement.limits.max_course_units == 2
     assert entitlement.limits.monthly_ai_queries == 30
     assert entitlement.limits.total_pdf_pages_pool == 100
+    # Both pool figures are the same on Free, which is what makes the monthly
+    # meter behave as the lifetime allowance it is: the month cannot refill
+    # past the total.
+    assert entitlement.limits.lifetime_pdf_pages == 100
+
+
+async def test_units_are_not_a_thing_a_plan_buys(client):
+    """
+    The same ceiling everywhere, Free included.
+
+    This is the regression guard on the change: the moment `unit_cap` starts
+    varying by tier again, a free student is refused half-way through building
+    their own timetable, before the app has shown them anything.
+    """
+    for tier in Tier:
+        assert unit_cap() == UNIT_HARD_CAP, tier
+
+
+async def test_a_paid_page_pool_refills(client):
+    """
+    The pool is a rate on a paid plan, not a wall.
+
+    It was lifetime for every tier, which meant a student who kept paying
+    eventually could not upload anything -- and got no reset date to explain
+    it, because a lifetime meter has none.
+    """
+    assert METRIC_PERIODS["pdf_pages"] is not METRIC_PERIODS["pdf_pages_lifetime"]
+    assert resets_on("pdf_pages") is not None
+    assert resets_on("pdf_pages_lifetime") is None
+
+    assert limits_for(Tier.PRO).lifetime_pdf_pages == UNLIMITED
+    assert limits_for(Tier.STANDARD).lifetime_pdf_pages == UNLIMITED
 
 
 async def test_the_free_monthly_allowance_actually_refuses(client):

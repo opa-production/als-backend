@@ -24,6 +24,7 @@ from app.models.knowledge import Material, MaterialChunk
 from app.models.notification import NotificationLog
 from app.models.planner import Event
 from app.models.referral import ReferralReward
+from app.models.release import AppRelease
 from app.models.settings import StudyDay, UserSettings
 from app.models.trial import TrialGrant
 from app.models.tutor import Chat, Message
@@ -32,6 +33,7 @@ __all__ = [
     "AdminAuditLog",
     "AdminRefreshToken",
     "AdminUser",
+    "AppRelease",
     "Base",
     "ClassSession",
     "Chat",

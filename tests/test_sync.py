@@ -9,7 +9,7 @@ edit does not raise, it just quietly ruins someone's semester.
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from app.services.plans import Tier
+from app.services.plans import UNIT_HARD_CAP, Tier
 from tests.conftest import OTHER_PHONE, give_plan, sign_in
 
 
@@ -132,7 +132,9 @@ async def test_a_deletion_travels_as_a_tombstone(client):
 
 async def test_the_cursor_only_returns_what_changed(client):
     headers, user_id = await sign_in(client)
-    # Two units, so the free plan's single-unit cap is not what this measures.
+    # A paid plan, so nothing here is measuring an entitlement. Units are not
+    # capped by tier any more, but the rest of the fixture reads clearer with a
+    # student who is plainly not up against any limit.
     await give_plan(client, user_id, Tier.PRO)
     now = datetime.now(UTC)
 
@@ -167,8 +169,13 @@ async def test_one_student_never_sees_another(client):
 
 async def test_the_unit_cap_rejects_the_row_not_the_request(client):
     """
-    Free allows two units. The rest are refused — and everything else in the
+    Over the ceiling, the extra units are refused — and everything else in the
     same push still has to land.
+
+    The cap is `UNIT_HARD_CAP` on every tier, Free included, so this pushes one
+    more than that rather than one more than a plan allowance. A free student
+    filing five or six units for their real semester is the normal case and
+    must never reach this path.
     """
     headers, _ = await sign_in(client)
     now = datetime.now(UTC)
@@ -177,9 +184,8 @@ async def test_the_unit_cap_rejects_the_row_not_the_request(client):
         "/api/v1/sync",
         json={
             "units": [
-                _unit(code="AAA101", updated=now),
-                _unit(code="BBB202", updated=now),
-                _unit(code="CCC303", updated=now),
+                _unit(code=f"AAA{index:03d}", updated=now)
+                for index in range(UNIT_HARD_CAP + 1)
             ],
             "events": [
                 {
@@ -198,24 +204,35 @@ async def test_the_unit_cap_rejects_the_row_not_the_request(client):
     )
 
     body = response.json()
-    assert body["units"]["applied"] == 2
+    assert body["units"]["applied"] == UNIT_HARD_CAP
     assert len(body["units"]["rejected"]) == 1
+    # The message must not send them to the paywall: no plan lifts this.
+    assert "plan" not in body["units"]["rejected"][0]
     # The event is not held hostage by the rejected unit.
     assert body["events"]["applied"] == 1
 
 
 async def test_editing_an_existing_unit_is_never_capped(client):
+    """
+    Renaming a unit you already have must never be refused, even at the cap.
+
+    Filled right to `UNIT_HARD_CAP` first, because a test that edits one of two
+    units when the ceiling is ten proves nothing about the guard.
+    """
     headers, _ = await sign_in(client)
     now = datetime.now(UTC)
     first = uuid.uuid4()
-    second = uuid.uuid4()
 
     await client.post(
         "/api/v1/sync",
         json={
             "units": [
-                _unit(first, code="AAA101", updated=now),
-                _unit(second, code="BBB202", updated=now),
+                _unit(
+                    first if index == 0 else uuid.uuid4(),
+                    code=f"AAA{index:03d}",
+                    updated=now,
+                )
+                for index in range(UNIT_HARD_CAP)
             ]
         },
         headers=headers,
@@ -226,7 +243,7 @@ async def test_editing_an_existing_unit_is_never_capped(client):
         "/api/v1/sync",
         json={
             "units": [
-                _unit(first, code="AAA101", title="Renamed", updated=now + timedelta(minutes=1))
+                _unit(first, code="AAA000", title="Renamed", updated=now + timedelta(minutes=1))
             ]
         },
         headers=headers,

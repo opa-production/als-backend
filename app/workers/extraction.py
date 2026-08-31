@@ -40,7 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.clock import now as utc_now
 from app.core.errors import QuotaExceeded
 from app.models.knowledge import Material, MaterialChunk
-from app.services.quota import check_pdf_pages, get_entitlement, record_usage
+from app.services.quota import check_pdf_pages, get_entitlement, record_pdf_pages
 from app.services.storage import Bucket, StorageError, SupabaseStorage
 
 log = structlog.get_logger()
@@ -266,7 +266,7 @@ async def extract_material(
         material.page_count = extracted.page_count
         material.extraction_status = "done"
         material.extraction_error = None
-        await record_usage(session, material.user_id, "pdf_pages", extracted.page_count)
+        await record_pdf_pages(session, material.user_id, extracted.page_count)
         await session.commit()
 
         log.info(

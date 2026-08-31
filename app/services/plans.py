@@ -6,9 +6,19 @@ from enum import StrEnum
 #: Unlimited. Mirrors the same constant in the app's ``src/theme/plans.js``.
 UNLIMITED = -1
 
-#: "Unlimited" units is still capped: retrieval quality falls off long before a
-#: student has fifty units filed, and an unlimited that degrades the product is
-#: worse than a stated number.
+#: How many units any student may file, on every tier including Free.
+#:
+#: Not a plan limit and not for sale. Units cost effectively nothing to hold —
+#: what costs money is pages extracted and questions answered, and both are
+#: metered on their own. Capping units by tier gated the cheap thing and did it
+#: at the worst possible moment: a Kenyan student takes five or six units a
+#: semester, so a two-unit ceiling refused them half-way through building their
+#: own timetable, before the app had shown them anything worth paying for.
+#:
+#: Ten is a *quality* ceiling and applies to everybody for the same reason.
+#: Retrieval is keyword search across one student's own corpus
+#: (``app/services/ai/retrieval.py``); precision falls off as that corpus grows,
+#: and an answer assembled from a fifty-unit haystack is worse than a refusal.
 UNIT_HARD_CAP = 10
 
 
@@ -41,8 +51,25 @@ _LEGACY_TIERS = {"expired": Tier.FREE}
 
 @dataclass(frozen=True)
 class Limits:
-    max_course_units: int
+    #: Pages extracted a month, and the meter that now does the work the unit
+    #: cap used to pretend to do. Pages are where a document actually costs
+    #: something — extraction, storage, and every later retrieval over it — so
+    #: this is the ceiling that bounds a filing habit, rather than a count of
+    #: folders.
+    #:
+    #: Monthly on every paid tier. It was lifetime for all of them, which meant
+    #: a student who paid for two years eventually could not upload anything
+    #: and got no explanation, because a lifetime meter has no reset date to
+    #: show. A paid period is what bounds a paid account; the pool refills with
+    #: it.
     total_pdf_pages_pool: int
+    #: The most this tier will ever extract, across every month it is held.
+    #:
+    #: Only Free sets one, for the same reason only Free sets
+    #: ``lifetime_ai_queries``: a monthly ceiling bounds the rate and not the
+    #: bill, and a free account that never converts must cost a finite amount
+    #: in total. UNLIMITED everywhere else.
+    lifetime_pdf_pages: int
     max_single_file_size_mb: int
     max_single_file_pages: int
     #: Questions a month, not a day.
@@ -124,8 +151,8 @@ SEASON_DAYS = 120
 
 
 _FOCUS_LIMITS = Limits(
-    max_course_units=4,
     total_pdf_pages_pool=400,
+    lifetime_pdf_pages=UNLIMITED,
     max_single_file_size_mb=25,
     max_single_file_pages=100,
     monthly_ai_queries=400,
@@ -140,8 +167,8 @@ _FOCUS_LIMITS = Limits(
 )
 
 _PRO_LIMITS = Limits(
-    max_course_units=10,
     total_pdf_pages_pool=1500,
+    lifetime_pdf_pages=UNLIMITED,
     max_single_file_size_mb=50,
     max_single_file_pages=300,
     monthly_ai_queries=1200,
@@ -185,16 +212,17 @@ PLANS: dict[Tier, Plan] = {
         duration_days=0,
         seats=1,
         limits=Limits(
-            # One unit is the point: enough to file a course and ask about it,
-            # not enough to carry a semester. The cap only ever refuses a
-            # *new* unit, so a student who paid, lapsed and has four keeps
-            # seeing all four.
-            # Two, not one. A student takes five or six units a semester, and
-            # a single slot does not let them file even a simplified version
-            # of their own week — which reads as "this app is not for me"
-            # rather than as a limit worth paying to lift.
-            max_course_units=2,
+            # Units are not rationed here any more — a free student files
+            # their whole semester, sees their real week, and meets the limit
+            # at the two things that actually cost us something: pages and
+            # questions. See UNIT_HARD_CAP.
+            #
+            # A hundred pages, and they do not come back. Both pool figures
+            # are the same number on Free, which is what makes it a lifetime
+            # allowance wearing a monthly meter's clothes: the month can never
+            # refill past the total.
             total_pdf_pages_pool=100,
+            lifetime_pdf_pages=100,
             max_single_file_size_mb=10,
             # The whole pool in one document, so a single 100-page lecture PDF
             # is uploadable rather than being refused for being one file.
@@ -228,8 +256,8 @@ PLANS: dict[Tier, Plan] = {
         duration_days=14,
         seats=1,
         limits=Limits(
-            max_course_units=2,
             total_pdf_pages_pool=100,
+            lifetime_pdf_pages=100,
             max_single_file_size_mb=10,
             max_single_file_pages=30,
             # The fortnight's worth, on a clock that now counts months. The
@@ -399,6 +427,13 @@ def limits_for(tier: str | Tier) -> Limits:
     return plan_for(tier).limits
 
 
-def unit_cap(tier: str | Tier) -> int:
-    limit = limits_for(tier).max_course_units
-    return UNIT_HARD_CAP if limit == UNLIMITED else min(limit, UNIT_HARD_CAP)
+def unit_cap() -> int:
+    """
+    How many units anyone may file. The same number on every tier.
+
+    Kept as a function rather than letting callers reach for ``UNIT_HARD_CAP``
+    directly, because it used to take a tier and the call sites read better
+    asking a question than quoting a constant — and because if a future plan
+    ever does buy more units, this is the one place that has to learn about it.
+    """
+    return UNIT_HARD_CAP

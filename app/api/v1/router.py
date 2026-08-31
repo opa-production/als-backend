@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from app.api.v1.routes import (
+    app_release,
     auth,
     billing,
     feedback,
@@ -15,6 +16,10 @@ from app.api.v1.routes.admin import admin_router
 api_router = APIRouter()
 
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
+
+# Unauthenticated, and first because it is the first thing the app calls. A
+# build too broken to sign in still has to be able to find out it is too old.
+api_router.include_router(app_release.router, prefix="/app", tags=["app"])
 api_router.include_router(me.router, prefix="/me", tags=["account"])
 # Mounted under /me because every one of these is a property of the account.
 api_router.include_router(settings.router, prefix="/me", tags=["account"])

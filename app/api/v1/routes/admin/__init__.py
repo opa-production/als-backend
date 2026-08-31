@@ -25,6 +25,7 @@ from app.api.v1.routes.admin import (
     overview,
     payments,
     referrals,
+    releases,
     revenue,
     subscriptions,
     users,
@@ -55,6 +56,9 @@ guarded.include_router(
     referrals.router, prefix="/referrals", tags=["admin: referrals"]
 )
 guarded.include_router(ops.router, prefix="/ops", tags=["admin: ops"])
+guarded.include_router(
+    releases.router, prefix="/releases", tags=["admin: releases"]
+)
 guarded.include_router(audit.router, prefix="/audit", tags=["admin: audit"])
 guarded.include_router(admins.router, prefix="/admins", tags=["admin: admins"])
 

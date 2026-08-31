@@ -123,7 +123,10 @@ async def push(
     *,
     user_id: uuid.UUID,
     payload: SyncPush,
-    entitlement: Entitlement,
+    #: Not read any more — the unit ceiling is the same on every tier. Kept on
+    #: the signature because this is where a per-plan sync limit would go if
+    #: one ever returns, and because every caller already resolves it.
+    entitlement: Entitlement,  # noqa: ARG001
 ) -> SyncPushResult:
     """
     Writes everything a device sends, and reports what happened to each table.
@@ -134,8 +137,13 @@ async def push(
     """
     result = SyncPushResult(cursor=utc_now())
 
-    # --- Units, capped by plan --------------------------------------------
-    cap = unit_cap(entitlement.tier)
+    # --- Units, capped for everyone ----------------------------------------
+    #
+    # The same ceiling on every tier, and not a thing that is sold. See
+    # `UNIT_HARD_CAP` for why: units cost nothing to hold, so rationing them by
+    # plan gated the cheap thing while the expensive ones — pages and questions
+    # — are metered on their own.
+    cap = unit_cap()
     live_units = await session.scalar(
         select(Unit.id)
         .where(Unit.user_id == user_id, Unit.deleted_at.is_(None))
@@ -161,7 +169,10 @@ async def push(
         if row.deleted_at is not None:
             return None
         if budget["left"] <= 0:
-            return f"over the {cap}-unit limit for this plan"
+            # Not "for this plan" any more — there is no plan that lifts it,
+            # and a message implying otherwise sends a student to the paywall
+            # to buy something that does not exist.
+            return f"over the {cap}-unit limit"
         budget["left"] -= 1
         return None
 

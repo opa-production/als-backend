@@ -214,6 +214,15 @@ class Settings(BaseSettings):
     #: actually ties the payment to a student.
     receipt_email_domain: str = "als.ardena.xyz"
 
+    # --- App releases -----------------------------------------------------
+    #
+    # Where the update modal sends someone who taps Update. Config rather than
+    # a column because these two URLs never change once the app is listed, and
+    # a per-release field nobody fills in is a per-release field somebody will
+    # eventually get wrong. A release row can still override them.
+    ios_store_url: str = ""
+    android_store_url: str = ""
+
     @property
     def payments_configured(self) -> bool:
         return bool(self.kora_secret_key)

@@ -7,6 +7,14 @@ Read [ARCHITECTURE.md](./ARCHITECTURE.md) first — it explains the decisions
 this scaffold encodes, including what goes to Supabase and what stays in
 Postgres.
 
+Then, as they come up:
+
+- [PLAN_LIMITS.md](./PLAN_LIMITS.md) — what each tier limits, and why it limits
+  that and not something else.
+- [APP_UPDATES.md](./APP_UPDATES.md) — getting a new build onto a phone: OTA for
+  JavaScript, the store and the update modal for everything else.
+- [DEPLOYMENT.md](./DEPLOYMENT.md) — the VPS, systemd and nginx.
+
 **No endpoints exist yet.** This is the setup only.
 
 ---

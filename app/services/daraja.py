@@ -217,7 +217,12 @@ async def access_token(client: httpx.AsyncClient) -> str:
             auth=(settings.daraja_consumer_key, settings.daraja_consumer_secret),
         )
     except httpx.HTTPError as error:
-        log.warning("daraja_token_unreachable", error=str(error))
+        log.warning(
+            "daraja_token_unreachable",
+            host=_root(),
+            environment=settings.daraja_environment,
+            error=str(error),
+        )
         raise AppError("We could not reach M-Pesa. Try again shortly.") from None
 
     if response.status_code >= 400:
@@ -266,6 +271,61 @@ def _timestamp() -> str:
 
 def _headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+
+#: Retried once, and only for failures where the request provably never left
+#: this machine.
+#:
+#: `ConnectError` covers DNS — "[Errno -3] Temporary failure in name resolution"
+#: arrives as one — and Safaricom's resolver is flaky enough that a single retry
+#: turns most of those into a successful payment rather than a fall back to a
+#: provider that charges us a percentage.
+#:
+#: A read timeout is deliberately **not** in here. That means the request was
+#: sent and the answer was lost, so a retry may put a *second* PIN prompt on a
+#: student's phone for one plan. Falling back is the cheap mistake; double
+#: prompting is not.
+_RETRYABLE = (httpx.ConnectError, httpx.ConnectTimeout)
+
+
+async def _post(
+    client: httpx.AsyncClient, path: str, payload: dict, token: str, *, reference: str
+) -> httpx.Response:
+    """
+    One Daraja call, with a single retry on a connection that never opened.
+
+    The host and environment go into the log because without them a failure is
+    unattributable: "name resolution failed" says nothing about *which* name,
+    and the answer — sandbox or production — is the first thing worth knowing.
+    """
+    url = f"{_root()}{path}"
+    last: Exception | None = None
+
+    for attempt in (1, 2):
+        try:
+            return await client.post(url, json=payload, headers=_headers(token))
+        except _RETRYABLE as error:
+            last = error
+            log.warning(
+                "daraja_connect_failed",
+                reference=reference,
+                attempt=attempt,
+                host=_root(),
+                environment=settings.daraja_environment,
+                error=str(error),
+            )
+        except httpx.HTTPError as error:
+            # Sent, and the answer lost. Not retried — see `_RETRYABLE`.
+            log.warning(
+                "daraja_unreachable",
+                reference=reference,
+                host=_root(),
+                environment=settings.daraja_environment,
+                error=str(error),
+            )
+            raise AppError("We could not reach M-Pesa. Try again shortly.") from None
+
+    raise AppError("We could not reach M-Pesa. Try again shortly.") from last
 
 
 # --- Pushing ------------------------------------------------------------------
@@ -329,15 +389,9 @@ async def push_stk(
         "TransactionDesc": description[:13],
     }
 
-    try:
-        response = await client.post(
-            f"{_root()}/mpesa/stkpush/v1/processrequest",
-            json=payload,
-            headers=_headers(token),
-        )
-    except httpx.HTTPError as error:
-        log.warning("daraja_push_unreachable", reference=reference, error=str(error))
-        raise AppError("We could not reach M-Pesa. Try again shortly.") from None
+    response = await _post(
+        client, "/mpesa/stkpush/v1/processrequest", payload, token, reference=reference
+    )
 
     if response.status_code >= 400:
         log.warning(
@@ -411,13 +465,14 @@ async def confirm(client: httpx.AsyncClient, checkout_request_id: str) -> Result
     }
 
     try:
-        response = await client.post(
-            f"{_root()}/mpesa/stkpushquery/v1/query",
-            json=payload,
-            headers=_headers(token),
+        response = await _post(
+            client,
+            "/mpesa/stkpushquery/v1/query",
+            payload,
+            token,
+            reference=checkout_request_id,
         )
-    except httpx.HTTPError as error:
-        log.warning("daraja_query_unreachable", error=str(error))
+    except AppError:
         # Unknown, not failed. A network blip must never read as "they did not
         # pay" — the student may well have, and the next poll will find out.
         return Result(result_code=-1, message="Still waiting for M-Pesa.", pending=True)

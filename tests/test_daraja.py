@@ -829,3 +829,128 @@ async def test_a_paybill_still_needs_only_one_number(client, mpesa, monkeypatch)
 
     assert mpesa.push_payload["BusinessShortCode"] == "174379"
     assert mpesa.push_payload["PartyB"] == "174379"
+
+
+# --- Flaky networks -----------------------------------------------------------
+#
+# Safaricom's resolver drops requests. The first real payment on this system
+# fell back to Kora with "[Errno -3] Temporary failure in name resolution" —
+# the fallback worked, and it also meant paying a processor's percentage for a
+# blip that a retry would have ridden out.
+
+
+def _both(mpesa, kora, fault=None):
+    """
+    Safaricom and Kora behind one transport, with an optional fault on the push.
+
+    Composed rather than replacing the whole handler, because a test about
+    Daraja failing is a test about *falling back* — and a transport that also
+    breaks Kora is testing nothing but itself.
+    """
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "korapay.com" in url:
+            return kora.handle(request)
+        if fault is not None and "/stkpush/v1/processrequest" in url:
+            raised = fault()
+            if raised is not None:
+                raise raised
+        return mpesa.handle(request)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handle))
+
+
+async def test_a_dns_blip_is_retried_rather_than_paid_around(client, mpesa, kora):
+    """
+    A connection that never opened is safe to retry: nothing reached Safaricom,
+    so no prompt was sent and a second attempt cannot double-charge anyone.
+    """
+    attempts = {"count": 0}
+
+    def flaky():
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            return httpx.ConnectError(
+                "[Errno -3] Temporary failure in name resolution"
+            )
+        return None
+
+    outbound = _both(mpesa, kora, flaky)
+    app.dependency_overrides[get_http_client] = lambda: outbound
+
+    headers, _ = await sign_in(client)
+    body = (await _pay(client, headers)).json()
+
+    assert attempts["count"] == 2, "a connect failure should be retried once"
+    assert body["mode"] == "stk", "the retry should have kept this on M-Pesa"
+    assert body["provider"] == "daraja"
+
+
+async def test_a_read_timeout_is_never_retried(client, mpesa, kora):
+    """
+    The one that must not be retried. A read timeout means the request *was*
+    sent and the answer was lost, so Safaricom may already be ringing the
+    student's phone — a second attempt puts two PIN prompts up for one plan.
+
+    Falling back to a pricier provider is the cheap mistake here. Charging
+    somebody twice is not.
+    """
+    attempts = {"count": 0}
+
+    def timing_out():
+        attempts["count"] += 1
+        return httpx.ReadTimeout("timed out waiting for a response")
+
+    outbound = _both(mpesa, kora, timing_out)
+    app.dependency_overrides[get_http_client] = lambda: outbound
+
+    headers, _ = await sign_in(client)
+    body = (await _pay(client, headers)).json()
+
+    assert attempts["count"] == 1, "a sent request must not be sent again"
+    assert body["mode"] == "redirect", "and it should fall back instead"
+
+
+async def test_a_persistent_outage_still_falls_back(client, mpesa, kora):
+    """Retrying twice and giving up is the point; retrying for ever is not."""
+    attempts = {"count": 0}
+
+    def always_failing():
+        attempts["count"] += 1
+        return httpx.ConnectError("name resolution failed")
+
+    outbound = _both(mpesa, kora, always_failing)
+    app.dependency_overrides[get_http_client] = lambda: outbound
+
+    headers, _ = await sign_in(client)
+    body = (await _pay(client, headers)).json()
+
+    assert attempts["count"] == 2, "exactly one retry, then give up"
+    assert body["mode"] == "redirect"
+    assert body["checkout_url"]
+
+
+async def test_the_failure_log_names_the_host_and_environment(
+    client, mpesa, kora, capsys
+):
+    """
+    "Temporary failure in name resolution" says nothing about *which* name, and
+    sandbox-versus-production is the first thing worth knowing when a payment
+    cannot reach Safaricom. Both were missing from the log the first time this
+    happened, which is why it took a guess to diagnose.
+    """
+
+    outbound = _both(
+        mpesa,
+        kora,
+        lambda: httpx.ConnectError("[Errno -3] Temporary failure in name resolution"),
+    )
+    app.dependency_overrides[get_http_client] = lambda: outbound
+
+    headers, _ = await sign_in(client)
+    await _pay(client, headers)
+
+    printed = capsys.readouterr().out
+    assert "safaricom.co.ke" in printed
+    assert "sandbox" in printed

@@ -1,6 +1,16 @@
 import uuid
+from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, SoftDelete, Timestamps, UuidPK, UUIDPrimaryKey
@@ -74,6 +84,20 @@ class Material(Base, UUIDPrimaryKey, Timestamps, SoftDelete):
     #: pending | running | done | failed | skipped
     extraction_status: Mapped[str] = mapped_column(String(16), default="pending")
     extraction_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    #: When the student was told this finished, or ``None`` if they have not
+    #: been. Set once, on the first sweep that picks the material up after it
+    #: reaches a terminal status.
+    #:
+    #: A column rather than a dedupe key computed from the row, because the
+    #: notification is *coalesced* — four photos filed in one sitting are one
+    #: notification naming the unit, not four buzzes, which is how somebody
+    #: turns notifications off for the whole app. There is no stable key for
+    #: "this group of four", so the fact of having told them is recorded per
+    #: material instead.
+    notified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 

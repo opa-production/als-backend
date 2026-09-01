@@ -28,7 +28,7 @@ import structlog
 from app.core.config import settings
 from app.core.logging import configure_logging
 from app.db.session import SessionLocal, dispose_engine
-from app.services import notifications, referrals
+from app.services import notifications, referrals, settlement
 from app.workers import extraction
 
 log = structlog.get_logger()
@@ -155,8 +155,8 @@ class Worker:
 
         self._next_sweep = loop_now + settings.reminder_sweep_seconds
 
-        try:
-            async with SessionLocal() as session:
+        async with SessionLocal() as session:
+            try:
                 await notifications.sweep(session, client=client)
                 # Rides the same cadence. Referral rewards move on a seven-day
                 # hold and a ninety-day expiry, so a minute either way is
@@ -164,8 +164,28 @@ class Worker:
                 # thing to get wrong.
                 await referrals.sweep(session)
                 await session.commit()
-        except Exception:  # noqa: BLE001 — extraction must outlive this
-            log.exception("reminder_sweep_failed")
+            except Exception:  # noqa: BLE001 — extraction must outlive this
+                log.exception("reminder_sweep_failed")
+                # So the sweep below starts on a session that is not already in
+                # a failed transaction. Without it, one bad reminder query would
+                # take the settlement sweep down with it every pass — and that
+                # sweep is the only thing standing between a card payment and a
+                # student locked out of what they paid for.
+                await session.rollback()
+
+            # Payments that were made and never heard about: a card payment
+            # whose student closed the tab before the redirect, an M-Pesa
+            # callback that was dropped.
+            #
+            # Its own `try` rather than its own session. The isolation that
+            # matters is that a payment provider having a bad minute cannot stop
+            # reminders — and reminders have already committed by this line, so
+            # a second connection would buy nothing but a second thing to fail
+            # to open.
+            try:
+                await settlement.sweep(session, client=client)
+            except Exception:  # noqa: BLE001 — extraction must outlive this
+                log.exception("settlement_sweep_failed")
 
     async def _sleep(self, seconds: float) -> None:
         """

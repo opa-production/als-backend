@@ -155,6 +155,8 @@ async def record_pending_payment(
     reference: str,
     tier: Tier,
     amount_kes: int,
+    provider: str = "kora",
+    checkout_request_id: str | None = None,
 ) -> Payment:
     """
     Notes that a charge was started, before anyone knows whether it succeeded.
@@ -176,10 +178,12 @@ async def record_pending_payment(
     payment = Payment(
         user_id=user_id,
         reference=reference,
+        provider=provider,
+        checkout_request_id=checkout_request_id,
         tier=tier.value,
         amount_kes=amount_kes,
         status="pending",
-        channel="",
+        channel="mpesa" if provider == "daraja" else "",
         paid_at=None,
     )
     session.add(payment)
@@ -188,7 +192,12 @@ async def record_pending_payment(
 
 
 async def record_payment(
-    session: AsyncSession, *, user_id: uuid.UUID, charge: Charge, tier: Tier
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    charge: Charge,
+    tier: Tier,
+    provider: str = "kora",
 ) -> tuple[Payment, bool]:
     """
     Stores a charge, once.
@@ -227,6 +236,7 @@ async def record_payment(
     payment = Payment(
         user_id=user_id,
         reference=charge.reference,
+        provider=provider,
         tier=tier.value,
         amount_kes=charge.amount_kes,
         status=charge.status,
@@ -300,6 +310,89 @@ def assert_charge_belongs_to(charge: Charge, *, user_id: uuid.UUID, email: str |
         "the reference.",
         status_code=403,
     )
+
+
+# --- M-Pesa, direct -----------------------------------------------------------
+#
+# A narrower path than the Kora one above, and narrower on purpose.
+#
+# For Kora and Paystack a charge arrives from outside carrying an amount, an
+# email and a metadata blob, and `tier_from_charge` and
+# `assert_charge_belongs_to` exist to decide how much of that to believe. An STK
+# push carries none of it: the amount was named by this server from its own plan
+# table, the payer was fixed by the token that opened the checkout, and the only
+# thing Safaricom contributes is "yes" or "no". So there is nothing to resolve
+# and nothing to trust — which is why this path has no equivalent of either
+# function, and why it is the safest of the three.
+
+
+async def payment_for_checkout_request(
+    session: AsyncSession, checkout_request_id: str
+) -> Payment | None:
+    """
+    The row an M-Pesa callback is talking about, if we opened it.
+
+    The whole authorisation story of the callback endpoint is this lookup. That
+    endpoint is unauthenticated — Safaricom signs nothing — so a request naming
+    a `CheckoutRequestID` this service never issued is somebody probing, and it
+    gets nothing.
+    """
+    if not checkout_request_id:
+        return None
+
+    return await session.scalar(
+        select(Payment).where(Payment.checkout_request_id == checkout_request_id)
+    )
+
+
+async def settle_mpesa(
+    session: AsyncSession,
+    *,
+    payment: Payment,
+    paid: bool,
+    receipt: str = "",
+    reason: str = "",
+) -> bool:
+    """
+    Closes out an STK prompt. Returns whether this call is the one that credited
+    the plan.
+
+    Everything about the payment except the verdict comes off the row that was
+    written when checkout started — the tier, the amount, the account. Only
+    ``paid`` comes from Safaricom, and only ever from `daraja.confirm`, never
+    from a callback body.
+
+    Idempotent by the same rule as `record_payment`: an already-successful row
+    returns False, so a callback and a poll arriving together credit the plan
+    once between them rather than once each.
+    """
+    if payment.status == "success":
+        return False
+
+    if receipt:
+        payment.receipt = receipt[:32]
+
+    if not paid:
+        # Recorded rather than left pending. A cancelled prompt that stays
+        # `pending` forever is indistinguishable in the console from one that is
+        # still ringing, and the student can simply try again — the next attempt
+        # gets its own reference.
+        payment.status = "failed"
+        payment.channel = payment.channel or "mpesa"
+        if reason:
+            # Reusing `channel` for a reason would be a lie; the console reads
+            # the status and the log carries the rest.
+            log.info(
+                "mpesa_not_paid", reference=payment.reference, reason=reason[:120]
+            )
+        await session.flush()
+        return False
+
+    payment.status = "success"
+    payment.channel = "mpesa"
+    payment.paid_at = utc_now()
+    await session.flush()
+    return True
 
 
 # --- Friends: one payment, six seats -----------------------------------------

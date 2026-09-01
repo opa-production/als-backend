@@ -13,7 +13,9 @@ from app.models.billing import Payment
 from app.schemas.admin import ActionResult, AdminPaymentRow, Page
 from app.services import audit as audit_service
 from app.services import billing as billing_service
+from app.services import daraja
 from app.services.kora import verify_transaction
+from app.services.plans import Tier, plan_for
 
 router = APIRouter()
 
@@ -86,10 +88,12 @@ async def list_payments(
             id=payment.id,
             user_id=payment.user_id,
             reference=payment.reference,
+            provider=payment.provider,
             tier=payment.tier,
             amount_kes=payment.amount_kes,
             status=payment.status,
             channel=payment.channel,
+            receipt=payment.receipt,
             paid_at=payment.paid_at,
             created_at=payment.created_at,
             full_name=user.full_name,
@@ -124,6 +128,73 @@ async def get_payment(payment_id: uuid.UUID, session: DbSession) -> dict:
     }
 
 
+async def _reconcile_mpesa(
+    session, *, payment: Payment, client, admin, ip
+) -> ActionResult:
+    """
+    The same button, asked of Safaricom.
+
+    Shorter than the Kora branch, and for the reason the M-Pesa path is
+    generally shorter: there is no charge object to interrogate. The tier, the
+    amount and the account were all fixed by this server when the prompt was
+    sent, so the only open question is whether the money moved — and
+    `daraja.confirm` is the only thing that answers it.
+
+    A prompt still on the handset is left alone rather than closed. Reconciling
+    a payment that is thirty seconds old and still live would mark a genuine
+    payment failed for being asked about too early.
+    """
+    if not daraja.configured():
+        raise AppError("M-Pesa is not configured in this environment.")
+    if not payment.checkout_request_id:
+        raise AppError(
+            "That M-Pesa payment has no Safaricom reference to check.",
+            status_code=409,
+        )
+
+    was = payment.status
+    result = await daraja.confirm(client, payment.checkout_request_id)
+
+    if result.pending:
+        return ActionResult(
+            ok=True,
+            message="Safaricom says that prompt is still being processed.",
+        )
+
+    credited = await billing_service.settle_mpesa(
+        session, payment=payment, paid=result.paid, reason=result.message
+    )
+    if credited:
+        await billing_service.apply_payment(
+            session, user_id=payment.user_id, tier=Tier(payment.tier)
+        )
+
+    await session.flush()
+    await audit_service.record(
+        session,
+        admin=admin,
+        action="payment.reconciled",
+        target_type="payment",
+        target_id=payment.id,
+        summary=(
+            f"Reconciled {payment.reference} with M-Pesa: "
+            f"{was} -> {payment.status}"
+            + (" and activated the plan" if credited else "")
+        ),
+        meta={"provider": "daraja", "result_code": result.result_code},
+        ip=ip,
+    )
+
+    return ActionResult(
+        ok=True,
+        message=(
+            f"Payment confirmed and {plan_for(Tier(payment.tier)).name} activated."
+            if credited
+            else f"Safaricom reports: {result.message}"
+        ),
+    )
+
+
 @router.post(
     "/{reference}/reconcile",
     response_model=ActionResult,
@@ -150,14 +221,24 @@ async def reconcile(
     repeatedly: ``record_payment`` keys on the reference, so a charge already
     credited is recognised rather than credited twice.
     """
-    if not settings.payments_configured:
-        raise AppError("Kora is not configured in this environment.")
-
     payment = await session.scalar(
         select(Payment).where(Payment.reference == reference)
     )
     if payment is None:
         raise NotFound("No payment with that reference.")
+
+    # Asked of whoever actually processed it. Before the `provider` column
+    # existed this always asked Kora, so pressing the button on an M-Pesa
+    # payment got "that payment could not be verified" — which reads exactly
+    # like "the student never paid", on the one screen support uses to decide
+    # whether somebody was charged.
+    if payment.provider == "daraja":
+        return await _reconcile_mpesa(
+            session, payment=payment, client=client, admin=admin, ip=ip
+        )
+
+    if not settings.payments_configured:
+        raise AppError("Kora is not configured in this environment.")
 
     charge = await verify_transaction(client, reference)
     was = payment.status

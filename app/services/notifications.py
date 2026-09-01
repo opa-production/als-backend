@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -32,6 +32,7 @@ from app.core.clock import as_utc
 from app.core.clock import now as utc_now
 from app.models.account import Device
 from app.models.course import ClassSession, Unit
+from app.models.knowledge import EXTRACTABLE_KINDS, Material
 from app.models.notification import NotificationLog
 from app.models.planner import Event
 from app.models.settings import UserSettings
@@ -84,6 +85,10 @@ class Reminder:
     subject_id: uuid.UUID
     #: The instant the thing being reminded about happens, in UTC.
     scheduled_for: datetime
+    #: For a coalesced notification: every material it speaks for, so they can
+    #: be stamped as told once it is actually reserved. Empty for reminders
+    #: that are about one event or one class.
+    material_ids: list[uuid.UUID] = field(default_factory=list)
 
 
 # --- The sweep ----------------------------------------------------------------
@@ -116,6 +121,7 @@ async def sweep(
     due: list[Reminder] = []
     due.extend(await _due_deadlines(session, preferences, moment))
     due.extend(await _due_classes(session, preferences, moment))
+    due.extend(await _finished_materials(session, preferences, moment))
 
     if not due:
         return 0
@@ -132,6 +138,11 @@ async def sweep(
     reserved = await _reserve(session, audible, moment)
     if not reserved:
         return 0
+
+    # Before delivery, not after: a push that fails to send has still been
+    # decided, and retrying it on the next sweep would notify twice as often as
+    # the provider is flaky.
+    await _mark_notified(session, reserved, moment)
 
     return await _deliver(session, reserved, tokens, provider)
 
@@ -514,3 +525,180 @@ async def send_test(
     await _clear_dead_tokens(session, result.dead_tokens)
     await session.flush()
     return result.sent
+
+
+# --- Documents that finished --------------------------------------------------
+
+
+#: The statuses that are worth interrupting somebody for, because nothing more
+#: is going to happen on its own.
+#:
+#: `failed` and `skipped` are in here deliberately. They are the ones that
+#: currently sit unnoticed for days — they need the student to *do* something,
+#: and unlike `done` there is no other moment when they will find out.
+TERMINAL = ("done", "failed", "skipped")
+
+#: How recently a material must have finished to be worth a notification.
+#:
+#: "Your notes are ready" is only true near the moment it becomes true. Without
+#: this, deploying the feature would announce every document in the table —
+#: "CS201: 12 pages are ready" for coursework a student filed in July — and any
+#: gap in the worker would later produce the same thing in miniature.
+#:
+#: A day, and the number is set by quiet hours rather than by staleness.
+#:
+#: Six hours was the first guess and it is wrong: the default quiet window is
+#: 22:00–06:00, so a student who files notes at half past ten at night has their
+#: notification held for seven and a half hours and then silently dropped for
+#: being too old. Quiet hours are meant to *delay* a notification, not cancel
+#: it, and any window shorter than the longest quiet period turns one into the
+#: other.
+#:
+#: Twenty-four hours clears that with room to spare, and still refuses anything
+#: genuinely stale — the case this exists for is a document filed in July, not
+#: one filed last night.
+FINISHED_WINDOW = timedelta(hours=24)
+
+
+async def _finished_materials(
+    session: AsyncSession,
+    preferences: dict[uuid.UUID, UserSettings],
+    moment: datetime,
+) -> list[Reminder]:
+    """
+    One notification per unit for documents that have just finished reading.
+
+    Coalesced, and that is the whole design. The realistic sequence is: shoot,
+    shoot, shoot, shoot, lock the phone, walk to a lecture. Four buzzes for one
+    action is how a student turns notifications off for the entire app, so four
+    photos filed into one unit is one notification naming the unit.
+
+    Polling only runs while the app is open, which means the moment worth
+    telling somebody about — their notes are ready to ask questions about — is
+    reliably the moment nobody is looking at the screen.
+    """
+    rows = (
+        await session.execute(
+            select(Material, Unit.code)
+            .join(Unit, Unit.id == Material.unit_id)
+            .where(
+                Material.user_id.in_(preferences.keys()),
+                Material.extraction_status.in_(TERMINAL),
+                Material.notified_at.is_(None),
+                Material.deleted_at.is_(None),
+                Material.updated_at >= moment - FINISHED_WINDOW,
+                # `note` and `link` are never read, so they never finish and
+                # there is nothing to announce.
+                Material.kind.in_(EXTRACTABLE_KINDS),
+            )
+            .order_by(Material.updated_at)
+        )
+    ).all()
+
+    if not rows:
+        return []
+
+    groups: dict[tuple[uuid.UUID, uuid.UUID], list[tuple[Material, str]]] = {}
+    for material, unit_code in rows:
+        groups.setdefault((material.user_id, material.unit_id), []).append(
+            (material, unit_code)
+        )
+
+    reminders = []
+    for (user_id, unit_id), members in groups.items():
+        materials = [material for material, _ in members]
+        unit_code = members[0][1]
+
+        reminders.append(
+            Reminder(
+                user_id=user_id,
+                kind="material",
+                # Unique per batch. The newest id is enough: a fifth document
+                # arriving later forms a different group with a different
+                # newest, and `notified_at` is what actually stops a repeat.
+                dedupe_key=f"material:{unit_id}:{max(str(m.id) for m in materials)}",
+                title=_finished_title(materials, unit_code),
+                body=_finished_body(materials),
+                # The unit, not one material: a coalesced notification has no
+                # single subject, and a tap that opens the unit puts every one
+                # of them on screen.
+                subject_id=unit_id,
+                scheduled_for=moment,
+                material_ids=[material.id for material in materials],
+            )
+        )
+
+    return reminders
+
+
+def _finished_title(materials: list[Material], unit_code: str) -> str:
+    ready = [m for m in materials if m.extraction_status == "done"]
+
+    if not ready:
+        # Nothing succeeded, so leading with "ready" would be a lie.
+        return f"{unit_code}: something needs your attention"
+
+    pages = sum(m.page_count or 1 for m in ready)
+    if len(ready) == 1:
+        return f"{unit_code}: {materials[0].title[:40]} is ready"
+    return f"{unit_code}: {pages} pages are ready"
+
+
+def _finished_body(materials: list[Material]) -> str:
+    """
+    What the notification says under the title.
+
+    The failures are named rather than counted. "1 could not be read" sends
+    somebody into the app to hunt for which one; naming it means the sentence
+    itself is the answer, and the card carries the reason when they get there.
+    """
+    ready = [m for m in materials if m.extraction_status == "done"]
+    failed = [m for m in materials if m.extraction_status == "failed"]
+    skipped = [m for m in materials if m.extraction_status == "skipped"]
+
+    parts = []
+    if ready:
+        parts.append(
+            "You can ask about it now."
+            if len(ready) == 1
+            else f"{len(ready)} documents are ready to ask about."
+        )
+    if failed:
+        parts.append(
+            f"{failed[0].title[:40]} could not be read."
+            if len(failed) == 1
+            else f"{len(failed)} could not be read."
+        )
+    if skipped:
+        parts.append(
+            f"{skipped[0].title[:40]} needs a bigger plan."
+            if len(skipped) == 1
+            else f"{len(skipped)} need a bigger plan."
+        )
+
+    return " ".join(parts)
+
+
+async def _mark_notified(
+    session: AsyncSession, reserved: list[tuple[Reminder, NotificationLog]], moment
+) -> None:
+    """
+    Record that the student has been told, so the next sweep does not tell them
+    again.
+
+    Stamped after reserving rather than while building the list, so a batch
+    dropped for quiet hours stays eligible — someone who files notes at 23:00
+    hears about them in the morning rather than never.
+    """
+    ids = [
+        material_id
+        for reminder, _ in reserved
+        for material_id in reminder.material_ids
+    ]
+    if not ids:
+        return
+
+    await session.execute(
+        update(Material).where(Material.id.in_(ids)).values(notified_at=moment)
+    )
+    await session.commit()

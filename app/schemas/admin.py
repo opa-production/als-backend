@@ -244,10 +244,17 @@ class AdminPaymentRow(BaseModel):
     id: uuid.UUID
     user_id: uuid.UUID
     reference: str
+    #: Who processed it: `daraja`, `kora` or `paystack`. On screen because the
+    #: reconcile button asks that provider, and because "the M-Pesa ones are all
+    #: failing" is a question the payments list should be able to answer.
+    provider: str = "kora"
     tier: str
     amount_kes: int
     status: str
     channel: str | None
+    #: The code on the student's M-Pesa SMS, when there is one. It is what they
+    #: quote to support, so it is what support should be able to search beside.
+    receipt: str | None = None
     paid_at: datetime | None
     created_at: datetime
 

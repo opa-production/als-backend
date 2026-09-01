@@ -8,6 +8,7 @@ from app.api.deps import CurrentUser, DbSession, HttpClient
 from app.core.errors import AppError, NotFound
 from app.models.course import Unit
 from app.models.knowledge import EXTRACTABLE_KINDS, Material
+from app.services.ai import ocr
 from app.services.quota import check_file_size, get_entitlement
 from app.services.storage import (
     ALLOWED_MIME,
@@ -92,6 +93,31 @@ async def create_upload_url(
     if payload.byte_size > MAX_BYTES[bucket]:
         ceiling = MAX_BYTES[bucket] // (1024 * 1024)
         raise AppError(f"Files must be under {ceiling}MB.")
+
+    if payload.kind == "image":
+        # The vision model has a ceiling of its own, well below the bucket's,
+        # and a photo over it is unreadable no matter how it got here.
+        #
+        # Refused now rather than at extraction, where it was refused before.
+        # The app downscales every capture, so this should be unreachable — but
+        # that makes a client's correctness load-bearing for a server-side
+        # limit, and the build already on a student's phone does not have that
+        # code. A refusal here is free; one after the upload has cost them the
+        # data already.
+        if payload.byte_size > ocr.MAX_IMAGE_BYTES:
+            ceiling = ocr.MAX_IMAGE_BYTES // (1024 * 1024)
+            raise AppError(
+                f"Photos must be under {ceiling}MB so they can be read. "
+                "Take it again at a lower resolution."
+            )
+        if payload.mime_type.lower() not in ocr.READABLE_MIME:
+            # HEIC reaches here: the scans bucket accepts it and no vision API
+            # reads it. Said now, with the setting to change, rather than after
+            # an upload that was never going to work.
+            raise AppError(
+                "That photo format cannot be read. Use JPEG or PNG — on an "
+                "iPhone, Settings → Camera → Formats → Most Compatible."
+            )
 
     entitlement = await get_entitlement(session, user.id)
     check_file_size(entitlement, payload.byte_size)

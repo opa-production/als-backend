@@ -11,6 +11,12 @@ Then, as they come up:
 
 - [PLAN_LIMITS.md](./PLAN_LIMITS.md) — what each tier limits, and why it limits
   that and not something else.
+- [APP_PAYMENTS.md](./APP_PAYMENTS.md) — for the app repo: taking a payment.
+  M-Pesa by phone number, cards by redirect, and the one rule about the shared
+  Paystack account.
+- [APP_EXTRACTION_UX.md](./APP_EXTRACTION_UX.md) — for the app repo: the whole
+  contract for telling a student what is happening to their document — status,
+  scans, and the notification when one finishes.
 - [APP_UPDATES.md](./APP_UPDATES.md) — getting a new build onto a phone: OTA for
   JavaScript, the store and the update modal for everything else.
 - [DEPLOYMENT.md](./DEPLOYMENT.md) — the VPS, systemd and nginx.

@@ -25,6 +25,7 @@ import httpx
 import pytest
 from sqlalchemy import select
 
+from app.core.clock import as_utc
 from app.core.config import settings
 from app.models.course import Unit
 from app.models.knowledge import Material, MaterialChunk
@@ -785,3 +786,128 @@ async def test_the_google_key_is_enough_on_its_own(client, monkeypatch):
         assert (
             await extraction.extract_material(session, material_id, client=http)
         ) == "done"
+
+
+# --- Reaching the student ------------------------------------------------------
+#
+# Everything above asserts the worker writes the right status. None of it
+# asserts a student ever *sees* it, and for a while none of them did: the row
+# went `done` in the database and the card in the app said "waiting to be read"
+# until the install was deleted.
+#
+# `GET /sync` is cursor-based and the cursor is `materials.updated_at`, so a
+# status the cursor cannot reach is a status that did not happen. These read
+# through the endpoint rather than out of the database, which is the only way
+# the difference shows up.
+
+
+async def _cursor(client, headers) -> str:
+    return (await client.get("/api/v1/sync", headers=headers)).json()["cursor"]
+
+
+async def _pull(client, headers, since: str) -> dict:
+    body = (await client.get(f"/api/v1/sync?since={since}", headers=headers)).json()
+    return {row["id"]: row for row in body["materials"]}
+
+
+async def test_a_finished_document_reaches_a_device_that_already_synced(client):
+    """
+    The regression test for the bug that made the whole feature invisible.
+
+    `updated_at` was being written — `onupdate=func.now()` fires — but Postgres
+    `now()` is the *transaction* timestamp, and this worker opens a transaction,
+    downloads a file, parses it, and only then commits. The row landed stamped
+    from before all of that, so a device polling in the meantime held a cursor
+    ahead of it and never saw the row again.
+
+    Reading the row back from the database passes either way. Only a pull with a
+    cursor taken before extraction catches it.
+    """
+    headers, user_id = await sign_in(client)
+    material_id = await _material(client, user_id)
+
+    # The app has synced and holds a cursor.
+    cursor = await _cursor(client, headers)
+
+    async with (
+        client.sessions() as session,
+        _client_serving(_pdf([TRANSCRIPT])) as http,
+    ):
+        assert (
+            await extraction.extract_material(session, material_id, client=http)
+        ) == "done"
+
+    pulled = await _pull(client, headers, cursor)
+
+    assert str(material_id) in pulled, "the finished document never comes back"
+    assert pulled[str(material_id)]["extraction_status"] == "done"
+
+
+async def test_a_failure_and_its_reason_reach_the_device(client):
+    """A reason the app never receives is a spinner that never stops."""
+    headers, user_id = await sign_in(client)
+    material_id = await _material(client, user_id)
+
+    cursor = await _cursor(client, headers)
+
+    async with client.sessions() as session, _client_serving(b"not a pdf") as http:
+        await extraction.extract_material(session, material_id, client=http)
+
+    row = (await _pull(client, headers, cursor))[str(material_id)]
+
+    assert row["extraction_status"] == "failed"
+    assert row["extraction_error"]
+
+
+async def test_a_scan_reaches_the_device_with_its_page_count(client, ocr_configured):
+    """
+    One photo is one page, and the app prints it.
+
+    Bundled with the visibility tests because `page_count` was always being set
+    — it just travelled on the same row that never arrived.
+    """
+    headers, user_id = await sign_in(client)
+    await _give(client, user_id, Tier.PRO)
+    material_id = await _scan(client, user_id)
+
+    cursor = await _cursor(client, headers)
+
+    async with client.sessions() as session, _scan_client() as http:
+        await extraction.extract_material(session, material_id, client=http)
+
+    row = (await _pull(client, headers, cursor))[str(material_id)]
+
+    assert row["extraction_status"] == "done"
+    assert row["page_count"] == 1
+
+
+async def test_every_transition_moves_the_cursor(client, ocr_configured):
+    """
+    Not only the happy one.
+
+    A worker that stamps four transitions out of five produces a bug that only
+    appears for one kind of failure, which is the hardest kind to find. This
+    walks the row through each status and asserts the stamp moved every time.
+    """
+    from app.models.knowledge import Material as M
+    from app.workers.extraction import set_status
+
+    _, user_id = await sign_in(client)
+    material_id = await _material(client, user_id)
+
+    seen = []
+    for status, error in (
+        ("running", None),
+        ("done", ""),
+        ("failed", "That PDF is password protected."),
+        ("skipped", "Scanning handwritten notes is a Synapse feature."),
+        ("pending", None),
+    ):
+        async with client.sessions() as session:
+            material = await session.get(M, material_id)
+            set_status(material, status, error=error)
+            await session.commit()
+            seen.append(as_utc(material.updated_at))
+
+    assert seen == sorted(seen), "a transition did not move updated_at forward"
+    assert len(set(seen)) == len(seen), "two transitions share a timestamp"

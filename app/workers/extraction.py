@@ -240,6 +240,44 @@ def chunk_pages(pages: list[tuple[int, str]]) -> list[tuple[int, str]]:
 # --- The job ------------------------------------------------------------------
 
 
+def set_status(material: Material, status: str, *, error: str | None = None) -> None:
+    """
+    Move a material to a new extraction status, visibly.
+
+    The second word is the whole point. `updated_at` is the cursor `GET /sync`
+    pages on, so a status the app never sees is a status that did not happen as
+    far as a student is concerned — the card sits on "waiting to be read" while
+    the database says `done` and the tutor quotes the document perfectly well.
+
+    `Timestamps.updated_at` already carries ``onupdate=func.now()``, and it does
+    fire: the UPDATE really does contain `updated_at`. What it contains is the
+    problem. **Postgres `now()` is `transaction_timestamp()` — the moment the
+    transaction opened, not the moment the row was written.** This worker opens
+    its transaction, then downloads a file and calls a vision model, and only
+    then commits; on a slow OCR call that is a minute of wall clock between the
+    two. The row lands stamped with a time from before all of it.
+
+    So a device that polls during that minute gets a cursor *ahead* of the
+    stamp, and the row is never returned again — not on the next pull, not on
+    any pull, for the life of the install. It is the worst shape a bug can have:
+    invisible in every test that reads the row back from the database, and
+    permanent for the student.
+
+    Stamped from the application clock instead, at the instant of the write.
+    Not `statement_timestamp()`, which would be correct and Postgres-only, and
+    not a trigger, which would be correct and untestable against the SQLite the
+    suite runs on. This is one function that every transition goes through, and
+    `test_extraction.py` asserts the result is reachable through a cursor pull
+    rather than by reading the row.
+    """
+    material.extraction_status = status
+    if error is not None:
+        material.extraction_error = error[:500] if error else None
+    material.updated_at = utc_now()
+
+
+
+
 async def extract_material(
     session: AsyncSession, material_id: uuid.UUID, *, client: httpx.AsyncClient
 ) -> str:
@@ -254,7 +292,7 @@ async def extract_material(
     if material is None or material.deleted_at is not None:
         return "gone"
 
-    material.extraction_status = "running"
+    set_status(material, "running")
     await session.commit()
 
     try:
@@ -277,8 +315,7 @@ async def extract_material(
         await _replace_chunks(session, material, chunks)
 
         material.page_count = extracted.page_count
-        material.extraction_status = "done"
-        material.extraction_error = None
+        set_status(material, "done", error="")
         await record_pdf_pages(session, material.user_id, extracted.page_count)
         if material.kind == "image":
             # Spent only now, on the way out. A scan that failed to read, or one
@@ -326,7 +363,7 @@ async def extract_material(
             material_id=str(material_id),
             error=str(error),
         )
-        material.extraction_status = "pending"
+        set_status(material, "pending")
         await session.commit()
         return "pending"
 
@@ -413,8 +450,7 @@ async def _replace_chunks(
 async def _fail(
     session: AsyncSession, material: Material, message: str, *, status: str = "failed"
 ) -> str:
-    material.extraction_status = status
-    material.extraction_error = message[:500]
+    set_status(material, status, error=message)
     await session.commit()
 
     log.warning(
@@ -496,7 +532,9 @@ async def requeue_stalled(session: AsyncSession, older_than_minutes: int = 15) -
     ).all()
 
     for material in rows:
-        material.extraction_status = "pending"
+        # Through `set_status` like every other transition: `running` back to
+        # `pending` is a change the app draws, so it has to move the cursor.
+        set_status(material, "pending")
 
     if rows:
         await session.commit()

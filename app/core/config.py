@@ -181,7 +181,74 @@ class Settings(BaseSettings):
     #: bill someone else can run up.
     otp_max_sends_per_hour: int = 5
 
-    # --- Payments ---------------------------------------------------------
+    # --- Payments: M-Pesa, direct ------------------------------------------
+    #
+    # Daraja is Safaricom's own API and the default way a student pays, because
+    # it is the cheapest: Kora and Paystack each take a percentage for standing
+    # between us and the same M-Pesa transaction. On a KES 150 plan that spread
+    # is most of the margin.
+    #
+    # With these unset the whole M-Pesa path falls back to Kora, quietly and by
+    # design — `daraja.configured()` is checked before a provider is chosen, so
+    # a deployment without credentials never puts a student through a request
+    # that cannot work.
+    daraja_consumer_key: str = ""
+    daraja_consumer_secret: str = ""
+
+    #: The paybill or till number the money lands in.
+    daraja_shortcode: str = ""
+
+    #: The Lipa na M-Pesa passkey. Half of the per-request password, with the
+    #: shortcode and a timestamp — see `app/services/daraja.py`.
+    daraja_passkey: str = ""
+
+    #: `sandbox` or `production`. Anything but "production" is sandbox, so a
+    #: typo cannot accidentally point a test deployment at real money.
+    daraja_environment: str = "sandbox"
+
+    #: `CustomerPayBillOnline` for a paybill, `CustomerBuyGoodsOnline` for a
+    #: till. Sending the wrong one is rejected with an error naming a field
+    #: rather than the mismatch, which is a slow afternoon.
+    daraja_transaction_type: str = "CustomerPayBillOnline"
+
+    #: The **till** number, on a Buy Goods account. Blank means "same as the
+    #: shortcode", which is correct for a paybill.
+    #:
+    #: On Buy Goods the pair is: `daraja_shortcode` is the *store* (head office)
+    #: number — the one the passkey is issued against — and this is the till the
+    #: money lands in. They are different numbers and swapping them fails.
+    daraja_party_b: str = ""
+
+    @property
+    def daraja_callback_url(self) -> str:
+        """
+        Where Safaricom posts the result of a prompt.
+
+        Derived from the public origin for the same reason Kora's is: behind
+        nginx the app sees `127.0.0.1:8000`, so a URL cannot be built from the
+        inbound request, and handing Safaricom that address means a payment
+        nobody is ever told about.
+        """
+        if self.daraja_callback_override:
+            return self.daraja_callback_override
+        if not self.public_base_url:
+            return ""
+        return f"{self.public_base_url.rstrip('/')}/api/v1/billing/mpesa/callback"
+
+    #: Set only when the callback has to go somewhere other than this service —
+    #: a tunnel while developing against the sandbox, most likely.
+    daraja_callback_override: str = ""
+
+    @property
+    def mpesa_configured(self) -> bool:
+        return bool(
+            self.daraja_consumer_key
+            and self.daraja_consumer_secret
+            and self.daraja_shortcode
+            and self.daraja_passkey
+        )
+
+    # --- Payments: the fallback --------------------------------------------
     #
     # Kora (korahq.com). Two things differ from the Paystack integration this
     # replaced, and both are silent when wrong: Kora charges in the **major**
@@ -205,6 +272,48 @@ class Settings(BaseSettings):
     #: link (`als://billing`) to have the payment page bounce straight back into
     #: the app instead.
     kora_callback_url: str = ""
+
+    # --- Payments: cards (Paystack) ----------------------------------------
+    #
+    # Cards are the one thing neither Daraja nor Kora covers here.
+    #
+    # This deployment shares a Paystack business with another product, and two
+    # dashboard settings therefore belong to whoever set it up first:
+    #
+    #   · The callback URL is bypassed per transaction — `callback_url` on
+    #     `transaction/initialize` overrides the dashboard for that transaction
+    #     only, so the other app's setting is untouched.
+    #   · The webhook URL **cannot** be bypassed. Paystack posts every event on
+    #     the account to the one configured URL, which is the other app's, so
+    #     this service never receives one and does not rely on one. Card
+    #     payments settle by asking Paystack — on return, and again from the
+    #     worker's sweep. See app/services/paystack.py.
+    paystack_secret_key: str = ""
+    #: Only used by a browser widget, which this product does not have. Kept so
+    #: the pair can be set together and nobody wonders where it went.
+    paystack_public_key: str = ""
+
+    @property
+    def paystack_callback_url(self) -> str:
+        """
+        Where the student comes back to after paying by card.
+
+        Sent per transaction, which is what makes a borrowed account workable.
+        Defaults to this service's own return page; set
+        `PAYSTACK_CALLBACK_OVERRIDE` to send them into the app by deep link
+        instead.
+        """
+        if self.paystack_callback_override:
+            return self.paystack_callback_override
+        if not self.public_base_url:
+            return ""
+        return f"{self.public_base_url.rstrip('/')}/api/v1/billing/card/return"
+
+    paystack_callback_override: str = ""
+
+    @property
+    def cards_configured(self) -> bool:
+        return bool(self.paystack_secret_key)
 
     #: Domain for the stand-in address used when an account has no email.
     #:

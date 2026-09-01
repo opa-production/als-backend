@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 
 import structlog
-from fastapi import APIRouter, Header, Request, status
+from fastapi import APIRouter, Header, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
@@ -10,8 +10,9 @@ from app.api.deps import CurrentUser, DbSession, HttpClient
 from app.core.config import settings
 from app.core.errors import AppError, Forbidden, NotFound
 from app.models.account import User
-from app.models.billing import PlanGroup, PlanGroupMember
+from app.models.billing import Payment, PlanGroup, PlanGroupMember
 from app.services import billing as billing_service
+from app.services import daraja, paystack
 from app.services.kora import (
     SUCCESS,
     build_metadata,
@@ -177,6 +178,25 @@ async def read_subscription(user: CurrentUser, session: DbSession) -> Subscripti
     )
 
 
+def _sellable(name: str) -> Tier:
+    """
+    The tier named, if it is one a student may actually buy.
+
+    In one place because three endpoints resolve a tier now, and a plan that is
+    sellable on one path and not another is how something gets bought that was
+    never meant to be for sale.
+    """
+    try:
+        tier = Tier(name)
+    except ValueError:
+        tier = None
+
+    if tier not in SELLABLE:
+        raise AppError("That is not a plan you can buy.")
+
+    return tier
+
+
 @router.post("/checkout", response_model=CheckoutOut, summary="Start a payment")
 async def start_checkout(
     payload: CheckoutRequest,
@@ -200,14 +220,7 @@ async def start_checkout(
     verify the exact transaction it opened rather than asking the student
     whether they paid.
     """
-    try:
-        tier = Tier(payload.tier)
-    except ValueError:
-        tier = None
-
-    if tier not in SELLABLE:
-        raise AppError("That is not a plan you can buy.")
-
+    tier = _sellable(payload.tier)
     plan = PLANS[tier]
 
     checkout = await initialize_transaction(
@@ -285,7 +298,43 @@ async def verify_payment(
     Safe to call repeatedly: the reference is unique, so a second call returns
     the same subscription instead of extending it again.
     """
-    charge = await verify_transaction(http, payload.reference)
+    # An M-Pesa reference belongs to Safaricom, and Kora has never heard of it.
+    # Asked anyway, the answer is "no such transaction", which this endpoint
+    # would report as "that payment has not gone through" — telling a student
+    # who has just been debited that they were not. Sent to the endpoint that
+    # can actually answer instead.
+    known = await session.scalar(
+        select(Payment).where(Payment.reference == payload.reference)
+    )
+    if known is not None and known.provider == "daraja":
+        raise AppError(
+            "Check that M-Pesa payment at /billing/mpesa/status.",
+            status_code=409,
+        )
+
+    # Asked of whoever opened it. A Paystack reference means nothing to Kora and
+    # the reverse is equally true, and either way the answer is "no such
+    # transaction" — which this endpoint would report to a student who has just
+    # been charged as "that payment has not gone through".
+    #
+    # For cards this call is not a backstop but the settlement path itself:
+    # Paystack's webhook goes to the dashboard URL, which on this shared account
+    # belongs to another product, so nothing is ever pushed to us.
+    by_card = known is not None and known.provider == "paystack"
+    provider = "paystack" if by_card else "kora"
+
+    if by_card:
+        charge = await paystack.verify_transaction(http, payload.reference)
+        # On a shared business a reference that verifies is not automatically
+        # ours. Both markers are set by this service at checkout and neither is
+        # guessable, so a transaction from the other app cannot buy a plan here.
+        if not paystack.is_ours(charge):
+            log.warning(
+                "paystack_verify_not_ours", reference=payload.reference[:40]
+            )
+            raise AppError("That payment is not one of ours.", status_code=403)
+    else:
+        charge = await verify_transaction(http, payload.reference)
 
     if charge.status != SUCCESS:
         # Kora reports `processing` and `pending` for a charge that is still
@@ -303,7 +352,7 @@ async def verify_payment(
 
     tier = billing_service.tier_from_charge(charge)
     _, is_new = await billing_service.record_payment(
-        session, user_id=user.id, charge=charge, tier=tier
+        session, user_id=user.id, charge=charge, tier=tier, provider=provider
     )
 
     if is_new:
@@ -380,7 +429,7 @@ async def kora_webhook(
         return {"received": True}
 
     _, is_new = await billing_service.record_payment(
-        session, user_id=owner, charge=charge, tier=tier
+        session, user_id=owner, charge=charge, tier=tier, provider="kora"
     )
 
     if is_new and charge.status == SUCCESS:
@@ -393,6 +442,501 @@ async def kora_webhook(
         first_delivery=is_new,
     )
     return {"received": True}
+
+
+# --- M-Pesa ------------------------------------------------------------------
+
+
+class MpesaRequest(BaseModel):
+    tier: str = Field(description="Which plan to buy.")
+    phone: str = Field(
+        max_length=20,
+        description="The M-Pesa number to charge. 07…, 01…, +254… all accepted.",
+    )
+
+
+class MpesaOut(BaseModel):
+    #: `stk` — a prompt is ringing, poll /billing/mpesa/status.
+    #: `redirect` — M-Pesa was unavailable, open `checkout_url` instead.
+    #:
+    #: The app must branch on this. It is the whole fallback contract, and it is
+    #: decided by the server rather than by the client noticing an error,
+    #: because "is Daraja healthy right now" is not a question a phone can
+    #: answer.
+    mode: str
+    #: `daraja` or `kora`. For support and for the app's own logging; the
+    #: student is never shown it.
+    provider: str
+    #: Hand this to /billing/mpesa/status while the prompt is on screen, or to
+    #: /billing/verify after a redirect checkout closes.
+    reference: str
+    #: What to show the student. On `stk` this is Safaricom's own wording of
+    #: "check your phone", which is worth showing verbatim because it is what
+    #: the handset is about to say.
+    message: str
+    tier: str
+    plan_name: str
+    amount_ksh: int
+    #: The number the prompt went to, normalised, so the app can show "sent to
+    #: 254712345678" and a student can spot a typo before waiting two minutes.
+    #: Empty on a redirect.
+    phone: str = ""
+    #: Only on `redirect`. Open it in a browser.
+    checkout_url: str | None = None
+
+
+class MpesaStatusOut(BaseModel):
+    #: pending | success | failed
+    status: str
+    #: What to show. On failure this is the reason, in words a student can act
+    #: on: "You cancelled the payment", "You do not have enough M-Pesa balance".
+    message: str
+    #: True while the prompt is still live. The app keeps polling on this rather
+    #: than on `status`, so a slow answer is never drawn as a failure.
+    pending: bool
+    #: Present once the plan is on. Saves a second call to /billing/subscription
+    #: at the one moment the student is watching the screen.
+    subscription: SubscriptionOut | None = None
+
+
+@router.post(
+    "/mpesa", response_model=MpesaOut, summary="Pay with M-Pesa (STK push)"
+)
+async def start_mpesa(
+    payload: MpesaRequest,
+    user: CurrentUser,
+    session: DbSession,
+    http: HttpClient,
+) -> MpesaOut:
+    """
+    Rings the student's phone with an M-Pesa PIN prompt.
+
+    The default way to pay, and the cheapest: this is Safaricom's own API, with
+    no processor in the middle taking a percentage of a KES 150 plan.
+
+    Nothing about the money comes from the request. The **amount** is read from
+    the server's plan table, so a client cannot choose its own price. The
+    **payer** is the caller's token, so the row is bound to an account before
+    the phone even rings — which is why the M-Pesa path needs no equivalent of
+    `assert_charge_belongs_to`: there is no moment at which the owner is in
+    doubt. The only thing the request supplies is which phone to ring, and
+    ringing the wrong phone costs an attacker money rather than earning them
+    anything.
+    """
+    tier = _sellable(payload.tier)
+    plan = PLANS[tier]
+
+    # Validated before anything else, and before the fallback is considered. A
+    # number that is not a Safaricom line cannot be paid from on either path, so
+    # refusing here is a message the student can act on rather than a Kora page
+    # that fails two steps later.
+    phone = daraja.normalise_phone(payload.phone)
+    reference = new_reference()
+
+    push = None
+    if daraja.configured() and settings.daraja_callback_url:
+        try:
+            push = await daraja.push_stk(
+                http,
+                phone=phone,
+                # From the plan table, never the request.
+                amount_kes=plan.price_ksh,
+                reference=reference,
+                description=f"ALS {plan.name}",
+                callback_url=settings.daraja_callback_url,
+            )
+        except AppError as error:
+            # Daraja is down, rate-limiting, or refusing the shortcode. The
+            # student is mid-payment and does not care whose fault it is, so
+            # this falls through to Kora rather than surfacing a provider
+            # outage as a dead end.
+            #
+            # Deliberately only `AppError` — everything `daraja` raises for a
+            # provider problem is one. A bug in this process should still
+            # surface as a 500 rather than quietly routing every student to the
+            # more expensive provider for weeks.
+            log.warning(
+                "mpesa_push_failed_falling_back",
+                user_id=str(user.id),
+                reference=reference,
+                error=error.message,
+            )
+
+    if push is None:
+        return await _mpesa_fallback(
+            user=user, session=session, http=http, tier=tier, plan=plan
+        )
+
+    # Written before the student can possibly answer the prompt. This row is
+    # the entire authorisation story of the callback endpoint that follows: a
+    # callback naming a CheckoutRequestID with no row here is discarded.
+    await billing_service.record_pending_payment(
+        session,
+        user_id=user.id,
+        reference=reference,
+        tier=tier,
+        amount_kes=plan.price_ksh,
+        provider="daraja",
+        checkout_request_id=push.checkout_request_id,
+    )
+    await session.commit()
+
+    log.info(
+        "mpesa_push_sent",
+        user_id=str(user.id),
+        tier=tier.value,
+        reference=reference,
+        checkout_request_id=push.checkout_request_id,
+    )
+
+    return MpesaOut(
+        mode="stk",
+        provider="daraja",
+        reference=reference,
+        message=push.customer_message,
+        tier=tier.value,
+        plan_name=plan.name,
+        amount_ksh=plan.price_ksh,
+        phone=phone,
+    )
+
+
+async def _mpesa_fallback(*, user, session, http, tier: Tier, plan) -> MpesaOut:
+    """
+    Kora, when Safaricom cannot be reached.
+
+    The last resort, and the word is accurate: it is the same M-Pesa payment
+    with a processor's percentage on top, so it exists to stop an outage costing
+    a sale rather than as a second way to pay.
+
+    A fresh reference is minted here. Reusing the one the failed push was opened
+    under would leave two providers' rows sharing a key, and the unique index
+    would turn a fallback into a 500 at the worst possible moment.
+    """
+    reference = new_reference()
+
+    checkout = await initialize_transaction(
+        http,
+        email=billing_service.receipt_email(user),
+        name=user.full_name or "ALS student",
+        amount_kes=plan.price_ksh,
+        reference=reference,
+        metadata=build_metadata(
+            user_id=str(user.id), tier=tier.value, plan_name=plan.name
+        ),
+        narration=f"ALS {plan.name}",
+        redirect_url=settings.kora_callback_url or None,
+        notification_url=settings.webhook_url or None,
+    )
+
+    await billing_service.record_pending_payment(
+        session,
+        user_id=user.id,
+        reference=checkout.reference,
+        tier=tier,
+        amount_kes=plan.price_ksh,
+        provider="kora",
+    )
+    await session.commit()
+
+    log.info(
+        "mpesa_fell_back_to_kora",
+        user_id=str(user.id),
+        tier=tier.value,
+        reference=checkout.reference,
+    )
+
+    return MpesaOut(
+        mode="redirect",
+        provider="kora",
+        reference=checkout.reference,
+        message="Continue on the payment page to finish with M-Pesa.",
+        tier=tier.value,
+        plan_name=plan.name,
+        amount_ksh=plan.price_ksh,
+        checkout_url=checkout.checkout_url,
+    )
+
+
+@router.get(
+    "/mpesa/status",
+    response_model=MpesaStatusOut,
+    summary="Has the M-Pesa payment gone through",
+)
+async def mpesa_status(
+    user: CurrentUser,
+    session: DbSession,
+    http: HttpClient,
+    reference: str = Query(max_length=120),
+) -> MpesaStatusOut:
+    """
+    What the app polls while the prompt is on the student's screen.
+
+    Asks Safaricom directly rather than waiting for the callback. Both routes
+    end in the same place, and this one is the reliable half: the callback is a
+    single unauthenticated POST that a dropped connection loses for ever, while
+    this can be asked again.
+
+    Scoped to the caller's own payments. A reference is not a secret — it is
+    printed on screens and pasted into support threads — so looking one up must
+    never reveal anything about somebody else's plan.
+    """
+    payment = await session.scalar(
+        select(Payment).where(
+            Payment.reference == reference, Payment.user_id == user.id
+        )
+    )
+    if payment is None:
+        raise NotFound("We have no record of that payment.")
+
+    if payment.status == "success":
+        return MpesaStatusOut(
+            status="success",
+            message="Payment received.",
+            pending=False,
+            subscription=await read_subscription(user, session),
+        )
+
+    if payment.status == "failed":
+        return MpesaStatusOut(
+            status="failed",
+            message="That payment did not go through. You have not been charged.",
+            pending=False,
+        )
+
+    if not payment.checkout_request_id:
+        raise AppError("That payment cannot be checked.", status_code=409)
+
+    result = await daraja.confirm(http, payment.checkout_request_id)
+
+    if result.pending:
+        return MpesaStatusOut(
+            status="pending", message=result.message, pending=True
+        )
+
+    credited = await billing_service.settle_mpesa(
+        session, payment=payment, paid=result.paid, reason=result.message
+    )
+    if credited:
+        await billing_service.apply_payment(
+            session, user_id=payment.user_id, tier=Tier(payment.tier)
+        )
+    await session.commit()
+
+    if result.paid:
+        return MpesaStatusOut(
+            status="success",
+            message="Payment received.",
+            pending=False,
+            subscription=await read_subscription(user, session),
+        )
+
+    return MpesaStatusOut(status="failed", message=result.message, pending=False)
+
+
+@router.post(
+    "/mpesa/callback",
+    status_code=status.HTTP_200_OK,
+    summary="M-Pesa callback",
+    include_in_schema=False,
+)
+async def mpesa_callback(request: Request, session: DbSession, http: HttpClient) -> dict:
+    """
+    Where Safaricom says a prompt was answered. **Nothing here is believed.**
+
+    Unlike Kora's webhook there is no signature to check, because Safaricom does
+    not sign these — no secret, no header, no mutual TLS. The body is plain JSON
+    posted to a URL, and anyone who can reach this endpoint can post one. Taking
+    it at its word would mean a free subscription for anybody who guesses a
+    `CheckoutRequestID`.
+
+    So this endpoint credits nothing. It does two things:
+
+    1. Looks the `CheckoutRequestID` up among rows **this service created**. No
+       row, no further work — that is the authorisation check, and it is why the
+       id is indexed.
+    2. Asks Safaricom what actually happened, through `daraja.confirm`, and acts
+       on *that*. A forged callback claiming success is answered by Safaricom
+       saying the prompt was cancelled, and nothing is credited.
+
+    Always 200, even for a body that made no sense. A non-2xx has Safaricom
+    redelivering for hours, and there is nothing here a retry could fix.
+    """
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        log.info("mpesa_callback_unreadable")
+        return {"ResultCode": 0, "ResultDesc": "Accepted"}
+
+    hint = daraja.read_callback(body)
+    if hint is None:
+        log.info("mpesa_callback_not_a_callback")
+        return {"ResultCode": 0, "ResultDesc": "Accepted"}
+
+    payment = await billing_service.payment_for_checkout_request(
+        session, hint.checkout_request_id
+    )
+    if payment is None:
+        # Somebody probing, or a callback for a deployment that shares this
+        # shortcode. Either way there is nothing of ours to credit.
+        log.warning(
+            "mpesa_callback_unknown_request",
+            checkout_request_id=hint.checkout_request_id[:40],
+        )
+        return {"ResultCode": 0, "ResultDesc": "Accepted"}
+
+    if payment.status == "success":
+        return {"ResultCode": 0, "ResultDesc": "Accepted"}
+
+    # The hint said something happened. Safaricom decides what.
+    result = await daraja.confirm(http, hint.checkout_request_id)
+
+    if result.pending:
+        # The query has not caught up with the callback yet. Left pending: the
+        # app's polling asks again, and a prompt that really was answered will
+        # be confirmed within seconds.
+        log.info("mpesa_callback_still_pending", reference=payment.reference)
+        return {"ResultCode": 0, "ResultDesc": "Accepted"}
+
+    credited = await billing_service.settle_mpesa(
+        session,
+        payment=payment,
+        paid=result.paid,
+        receipt=hint.receipt,
+        reason=result.message,
+    )
+    if credited:
+        await billing_service.apply_payment(
+            session, user_id=payment.user_id, tier=Tier(payment.tier)
+        )
+    await session.commit()
+
+    log.info(
+        "mpesa_callback_settled",
+        reference=payment.reference,
+        paid=result.paid,
+        credited=credited,
+    )
+    return {"ResultCode": 0, "ResultDesc": "Accepted"}
+
+
+# --- Cards --------------------------------------------------------------------
+#
+# Paystack, on a business shared with another product. Two consequences, both
+# handled here rather than assumed away:
+#
+#   · The dashboard's callback URL belongs to the other app, so ours is sent per
+#     transaction and overrides it for that transaction only.
+#   · The dashboard's webhook URL also belongs to the other app, and there is no
+#     per-transaction override. This service will never receive a Paystack
+#     webhook. Card payments settle by *asking* — on return from checkout, and
+#     again from the worker's sweep for anyone who never came back.
+
+
+class CardRequest(BaseModel):
+    tier: str = Field(description="Which plan to buy.")
+
+
+class CardOut(BaseModel):
+    #: Open this in a browser. Single-use and belongs to one student.
+    checkout_url: str
+    #: Hand back to /billing/verify when the browser closes.
+    reference: str
+    tier: str
+    plan_name: str
+    amount_ksh: int
+
+
+@router.post("/card", response_model=CardOut, summary="Pay by card")
+async def start_card(
+    payload: CardRequest,
+    user: CurrentUser,
+    session: DbSession,
+    http: HttpClient,
+) -> CardOut:
+    """
+    Opens a Paystack card checkout for this student and this plan.
+
+    The price comes from the server's plan table and `metadata.user_id` is
+    written from the caller's token, so the transaction knows whose it is before
+    a card number is typed. On an account shared with another product that is
+    not just convenient — it is what lets `paystack.is_ours` tell an ALS payment
+    from somebody else's, and the reason another app's KES 350 transaction can
+    never turn on a plan here.
+    """
+    tier = _sellable(payload.tier)
+    plan = PLANS[tier]
+
+    if not paystack.configured():
+        raise AppError(
+            "Card payments are not available right now. Try M-Pesa.",
+            status_code=503,
+        )
+
+    reference = new_reference()
+
+    checkout = await paystack.initialize_transaction(
+        http,
+        email=billing_service.receipt_email(user),
+        # Shillings in, minor units on the wire — the adapter multiplies. Sent
+        # from the plan table, never from the request.
+        amount_kes=plan.price_ksh,
+        reference=reference,
+        metadata=build_metadata(
+            user_id=str(user.id), tier=tier.value, plan_name=plan.name
+        ),
+        # Per transaction, which is what bypasses the dashboard default without
+        # touching the other app's setting.
+        callback_url=settings.paystack_callback_url or None,
+    )
+
+    await billing_service.record_pending_payment(
+        session,
+        user_id=user.id,
+        reference=checkout.reference,
+        tier=tier,
+        amount_kes=plan.price_ksh,
+        provider="paystack",
+    )
+    await session.commit()
+
+    log.info(
+        "card_checkout_started",
+        user_id=str(user.id),
+        tier=tier.value,
+        reference=checkout.reference,
+    )
+
+    return CardOut(
+        checkout_url=checkout.checkout_url,
+        reference=checkout.reference,
+        tier=tier.value,
+        plan_name=plan.name,
+        amount_ksh=plan.price_ksh,
+    )
+
+
+@router.get(
+    "/card/return",
+    summary="Where Paystack sends the student back",
+    include_in_schema=False,
+)
+async def card_return(reference: str = Query(default="", max_length=120)) -> dict:
+    """
+    The landing page after a card payment, and deliberately almost nothing.
+
+    Paystack redirects a *browser* here, with no session and no token — so this
+    cannot credit anything, and must not pretend to. Crediting from an
+    unauthenticated GET carrying a reference would be a plan for anyone who can
+    read a URL out of somebody's browser history.
+
+    The app is watching for this redirect and calls `/billing/verify` with its
+    own token, which is where the payment actually becomes a subscription.
+    """
+    return {
+        "reference": reference,
+        "message": "Payment received. Return to the app to finish.",
+    }
 
 
 # --- Friends -----------------------------------------------------------------

@@ -118,7 +118,7 @@ class PlanGroupMember(Base, UUIDPrimaryKey, Timestamps):
 
 class Payment(Base, UUIDPrimaryKey, Timestamps):
     """
-    A Kora transaction, as Kora described it.
+    One transaction, whoever processed it.
 
     Nothing here is a card number. The reference and the status are all a
     webhook gives us and all we have any business keeping.
@@ -130,9 +130,35 @@ class Payment(Base, UUIDPrimaryKey, Timestamps):
         ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
     )
 
-    #: Kora's reference, unique so a webhook delivered three times — which
-    #: it will be — credits the plan exactly once.
+    #: Our own reference, minted at checkout and unique, so a webhook delivered
+    #: three times — which it will be — credits the plan exactly once.
     reference: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
+
+    #: Which provider is the authority on this row: `daraja`, `kora` or
+    #: `paystack`.
+    #:
+    #: Not decoration. `/billing/verify` and the console's reconcile button both
+    #: have to ask *somebody* what happened to a reference, and asking the wrong
+    #: provider returns "no such transaction" — which reads identically to "they
+    #: did not pay". Existing rows predate the column and are all Kora, which is
+    #: what the migration backfills.
+    provider: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="kora", server_default="kora"
+    )
+
+    #: Safaricom's handle for one STK prompt, and the only thing that ties an
+    #: unauthenticated M-Pesa callback back to a row this service created.
+    #:
+    #: Indexed because the callback arrives knowing nothing else — no user, no
+    #: reference of ours it can be trusted on, just this — so it is the lookup
+    #: key on a path that must not table-scan. Null for every other provider.
+    checkout_request_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+
+    #: The code on the student's M-Pesa SMS. Kept because it is what somebody
+    #: quotes to support, never used to decide anything.
+    receipt: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     tier: Mapped[str] = mapped_column(String(16), nullable=False)
     amount_kes: Mapped[int] = mapped_column(Integer, nullable=False)

@@ -162,6 +162,9 @@ async def test_a_stop_mid_batch_leaves_the_rest_for_the_next_pass(monkeypatch, c
     monkeypatch.setattr(extraction, "claim_batch", claim)
     monkeypatch.setattr(extraction, "extract_material", extract)
     monkeypatch.setattr(extraction, "requeue_stalled", no_requeue)
+    # The tick also sweeps reminders and payments, both of which would reach
+    # for a database this test has no business opening.
+    monkeypatch.setattr(Worker, "_sweep_reminders", _no_sweep)
 
     worker = Worker()
     await asyncio.wait_for(worker.run(), timeout=5)
@@ -189,6 +192,7 @@ async def test_the_sweep_runs_on_its_own_cadence(monkeypatch):
         return 0
 
     monkeypatch.setattr("app.services.notifications.sweep", counting_sweep)
+    monkeypatch.setattr("app.services.settlement.sweep", _no_settlement)
     monkeypatch.setattr("app.workers.runner.SessionLocal", _NullSessions)
 
     worker = Worker()
@@ -218,17 +222,42 @@ async def test_a_failing_sweep_does_not_stop_extraction(monkeypatch):
         raise RuntimeError("expo is down")
 
     monkeypatch.setattr("app.services.notifications.sweep", exploding_sweep)
+    monkeypatch.setattr("app.services.settlement.sweep", _no_settlement)
     monkeypatch.setattr("app.workers.runner.SessionLocal", _NullSessions)
 
     worker = Worker()
     await worker._sweep_reminders(object())  # must not raise
 
 
+async def _no_settlement(session, **kwargs):
+    return 0
+
+
+async def _no_sweep(self, client):
+    return None
+
+
+class _NullSession:
+    """
+    Enough of a session for the sweep block to run against.
+
+    `commit` and `rollback` are real methods now because the tick rolls back
+    between the two sweeps — a null that raises on `rollback` would fail the
+    test for a reason that has nothing to do with what it is testing.
+    """
+
+    async def commit(self):
+        return None
+
+    async def rollback(self):
+        return None
+
+
 class _NullSessions:
-    """A session context manager that yields nothing real."""
+    """A session context manager that yields the stub above."""
 
     async def __aenter__(self):
-        return None
+        return _NullSession()
 
     async def __aexit__(self, *exc):
         return False

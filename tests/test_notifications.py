@@ -13,6 +13,7 @@ preference in the student's own zone. The tests use Nairobi (UTC+3, no DST) so
 an off-by-a-timezone is a three hour error and cannot hide.
 """
 
+import itertools
 import uuid
 from datetime import UTC, datetime, time, timedelta
 
@@ -28,6 +29,9 @@ from app.services.push import PushMessage, PushResult
 from tests.conftest import sign_in
 
 TOKEN = "ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]"
+
+#: Keeps unit codes unique across materials filed in one test.
+_UNIT_CODES = itertools.count(1)
 
 #: 2026-09-01 is a Tuesday. 09:00 UTC is midday in Nairobi, which is outside
 #: any default quiet window — so a test that gets silence got it for the reason
@@ -534,3 +538,230 @@ async def test_the_notification_list_is_scoped_to_the_account(client):
     other_headers, _ = await sign_in(client, phone=OTHER_PHONE)
     body = (await client.get("/api/v1/me/notifications", headers=other_headers)).json()
     assert body == []
+
+
+# --- Documents that finished --------------------------------------------------
+#
+# Polling only runs while the app is open, so the moment worth telling somebody
+# about — their notes are ready to ask questions about — is reliably the moment
+# nobody is looking at the screen. These pin the shape of that notification, and
+# most of what they pin is *restraint*: four photos filed in one sitting must be
+# one buzz, not four, and nothing stale must ever be announced.
+
+
+async def _add_material(
+    client,
+    user_id,
+    *,
+    unit_id=None,
+    unit_code="CS201",
+    status="done",
+    title="Week 4 notes",
+    finished_at=None,
+    pages=1,
+):
+    from app.models.knowledge import Material
+
+    async with client.sessions() as session:
+        if unit_id is None:
+            # Unique per call: `units` has UNIQUE(user_id, code), so two
+            # materials filed under the default code would collide.
+            code = f"{unit_code}{next(_UNIT_CODES)}"
+            unit = Unit(id=uuid.uuid4(), user_id=user_id, code=code, title="C")
+            session.add(unit)
+            await session.flush()
+            unit_id = unit.id
+
+        material = Material(
+            id=uuid.uuid4(),
+            user_id=user_id,
+            unit_id=unit_id,
+            kind="pdf",
+            title=title,
+            extraction_status=status,
+            extraction_error=None if status == "done" else "Could not read that.",
+            page_count=pages,
+            updated_at=finished_at or NOON_IN_NAIROBI,
+        )
+        session.add(material)
+        await session.commit()
+        return unit_id, material.id
+
+
+async def test_a_finished_document_is_announced(client):
+    _, user_id = await _account(client)
+    await _add_material(client, user_id)
+    provider = FakeProvider()
+
+    assert await _sweep(client, now=NOON_IN_NAIROBI, provider=provider) == 1
+    assert "ready" in provider.sent[0].title
+
+
+async def test_four_photos_in_one_unit_are_one_notification(client):
+    """
+    The rule that decides whether notifications stay switched on.
+
+    Shoot, shoot, shoot, shoot, lock the phone. Four buzzes for one action is
+    how somebody turns them off for the entire app.
+    """
+    _, user_id = await _account(client)
+    unit_id, _ = await _add_material(client, user_id, title="Page 1")
+    for page in range(2, 5):
+        await _add_material(client, user_id, unit_id=unit_id, title=f"Page {page}")
+
+    provider = FakeProvider()
+
+    assert await _sweep(client, now=NOON_IN_NAIROBI, provider=provider) == 1
+    assert len(provider.sent) == 1
+    assert "4 pages are ready" in provider.sent[0].title
+
+
+async def test_a_notification_held_by_quiet_hours_is_not_lost_to_staleness(client):
+    """
+    The reason `FINISHED_WINDOW` is a day rather than the six hours it started
+    as.
+
+    Quiet hours delay a notification; the freshness window drops one. Set the
+    window shorter than the longest quiet period and the first quietly becomes
+    the second — notes filed at 22:30 are held until 06:00 and then discarded
+    for being too old, so the student is never told at all.
+    """
+    from app.services.notifications import FINISHED_WINDOW
+
+    _, user_id = await _account(client)
+    # 22:30 Nairobi, near the start of the default 22:00-06:00 window.
+    night = datetime(2026, 9, 1, 19, 30, tzinfo=UTC)
+    await _add_material(client, user_id, finished_at=night)
+
+    provider = FakeProvider()
+    assert await _sweep(client, now=night, provider=provider) == 0
+
+    # 07:00 Nairobi the next morning: the longest a default quiet window can
+    # hold anything.
+    morning = night + timedelta(hours=8, minutes=30)
+    assert morning - night < FINISHED_WINDOW
+    assert await _sweep(client, now=morning, provider=provider) == 1
+
+
+async def test_two_units_are_two_notifications(client):
+    """Coalescing is per unit, not per sweep — they are different subjects."""
+    _, user_id = await _account(client)
+    await _add_material(client, user_id, unit_code="CS201")
+    await _add_material(client, user_id, unit_code="MAT204")
+
+    provider = FakeProvider()
+
+    assert await _sweep(client, now=NOON_IN_NAIROBI, provider=provider) == 2
+
+
+async def test_a_student_is_told_once(client):
+    """
+    The sweep runs every minute and the row stays `done` for ever.
+
+    This is the same failure the deadline reminders exist to prevent, arriving
+    by a different route.
+    """
+    _, user_id = await _account(client)
+    await _add_material(client, user_id)
+    provider = FakeProvider()
+
+    assert await _sweep(client, now=NOON_IN_NAIROBI, provider=provider) == 1
+    assert await _sweep(client, now=NOON_IN_NAIROBI, provider=provider) == 0
+    later = NOON_IN_NAIROBI + timedelta(minutes=30)
+    assert await _sweep(client, now=later, provider=provider) == 0
+
+
+async def test_a_failure_is_announced_too(client):
+    """
+    `failed` and `skipped` are terminal and need the student to do something.
+
+    They are also the ones that currently sit unnoticed for days: unlike `done`,
+    there is no other moment when somebody finds out.
+    """
+    _, user_id = await _account(client)
+    await _add_material(client, user_id, status="failed", title="Blurry page")
+
+    provider = FakeProvider()
+
+    assert await _sweep(client, now=NOON_IN_NAIROBI, provider=provider) == 1
+    message = provider.sent[0]
+    # Not "ready" — nothing succeeded, and saying so would be a lie.
+    assert "ready" not in message.title
+    assert "Blurry page" in message.body
+
+
+async def test_a_mixed_batch_leads_with_what_worked(client):
+    _, user_id = await _account(client)
+    unit_id, _ = await _add_material(client, user_id, title="Page 1")
+    await _add_material(client, user_id, unit_id=unit_id, title="Page 2")
+    await _add_material(
+        client, user_id, unit_id=unit_id, status="failed", title="Blurry"
+    )
+
+    provider = FakeProvider()
+    await _sweep(client, now=NOON_IN_NAIROBI, provider=provider)
+
+    body = provider.sent[0].body
+    assert "2 documents are ready" in body
+    # Named, not counted: "1 could not be read" sends someone hunting.
+    assert "Blurry could not be read" in body
+
+
+async def test_a_document_still_being_read_is_not_announced(client):
+    _, user_id = await _account(client)
+    await _add_material(client, user_id, status="pending")
+    await _add_material(client, user_id, status="running")
+
+    provider = FakeProvider()
+
+    assert await _sweep(client, now=NOON_IN_NAIROBI, provider=provider) == 0
+
+
+async def test_last_terms_coursework_is_not_announced(client):
+    """
+    "Your notes are ready" is only true near the moment it becomes true.
+
+    Without the freshness window, deploying this would have announced every
+    document in the table — including coursework filed in July.
+    """
+    _, user_id = await _account(client)
+    await _add_material(
+        client, user_id, finished_at=NOON_IN_NAIROBI - timedelta(days=40)
+    )
+
+    provider = FakeProvider()
+
+    assert await _sweep(client, now=NOON_IN_NAIROBI, provider=provider) == 0
+
+
+async def test_quiet_hours_delay_rather_than_cancel(client):
+    """
+    Someone who files notes at 23:00 hears about it in the morning.
+
+    `notified_at` is stamped on reserve, not while building the batch, which is
+    what keeps a silenced notification eligible instead of losing it.
+    """
+    _, user_id = await _account(client)
+    # 23:30 in Nairobi, inside the default 22:00–06:00 window.
+    night = datetime(2026, 9, 1, 20, 30, tzinfo=UTC)
+    await _add_material(client, user_id, finished_at=night)
+
+    provider = FakeProvider()
+    assert await _sweep(client, now=night, provider=provider) == 0
+
+    morning = night + timedelta(hours=8)
+    assert await _sweep(client, now=morning, provider=provider) == 1
+
+
+async def test_the_tap_opens_the_unit(client):
+    """
+    A coalesced notification has no single subject, and a tap that opens the
+    unit puts every document in the batch on screen.
+    """
+    _, user_id = await _account(client)
+    unit_id, _ = await _add_material(client, user_id)
+
+    provider = FakeProvider()
+    await _sweep(client, now=NOON_IN_NAIROBI, provider=provider)
+
+    assert provider.sent[0].data == {"kind": "material", "id": str(unit_id)}

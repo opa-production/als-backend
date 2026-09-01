@@ -11,18 +11,19 @@ import hmac
 import json
 from datetime import datetime
 
-import httpx
 import pytest
 
-from app.api.deps import get_http_client
 from app.core.clock import as_utc
 from app.core.clock import now as utc_now
 from app.core.config import settings
-from app.main import app
 from app.services import billing as billing_service
 from app.services.billing import activate, tier_from_charge
 from app.services.kora import Charge, to_shillings, verify_signature
 from app.services.plans import Tier, plan_for, saving_percent
+
+# `kora` — the outbound-provider stub — lives in conftest now: the M-Pesa
+# tests need the same fallback provider, and a fixture imported from one
+# test module into another is a fixture that gets shadowed.
 from tests.conftest import OTHER_PHONE, sign_in
 
 SECRET = "test-webhook-secret"
@@ -527,76 +528,6 @@ async def test_only_sellable_plans_are_advertised(client):
 # --- Checkout -----------------------------------------------------------------
 
 
-class _FakeKora:
-    """
-    Stands in for Kora and remembers what it was sent.
-
-    What matters in these tests is the *request* — the amount and the metadata
-    are what a wrong checkout gets wrong, and both are decided on this side
-    rather than by Kora.
-    """
-
-    def __init__(self):
-        self.payload = None
-        #: What a later verify should report. Tests that only exercise checkout
-        #: never look at it.
-        self.verify_status = "success"
-        self.verify_amount = None
-
-    def handle(self, request: httpx.Request) -> httpx.Response:
-        # Verifying a reference is a GET with no body; creating a charge is a
-        # POST with one. Branching on the method keeps both in one fake.
-        if request.method == "GET":
-            reference = str(request.url).rstrip("/").rsplit("/", 1)[-1]
-            amount = self.verify_amount
-            if amount is None:
-                amount = (self.payload or {}).get("amount", 0)
-            return httpx.Response(
-                200,
-                json={
-                    "status": True,
-                    "message": "Charge retrieved",
-                    "data": {
-                        "reference": reference,
-                        "status": self.verify_status,
-                        "amount": amount,
-                        "currency": "KES",
-                        "payment_method": "mobile_money",
-                        "metadata": (self.payload or {}).get("metadata", {}),
-                    },
-                },
-            )
-
-        self.payload = json.loads(request.content)
-        return httpx.Response(
-            200,
-            json={
-                "status": True,
-                "message": "Charge created successfully",
-                "data": {
-                    "checkout_url": "https://checkout.korapay.com/abc123/pay",
-                    "reference": self.payload["reference"],
-                },
-            },
-        )
-
-
-@pytest.fixture
-def kora(client, monkeypatch):
-    """
-    Swaps the *outbound* client only.
-
-    Patching ``httpx.AsyncClient.post`` would also intercept the test client's
-    own requests into the app, since both are httpx — so the seam is the
-    dependency, not the library.
-    """
-    monkeypatch.setattr(settings, "kora_secret_key", "sk_test_x")
-    fake = _FakeKora()
-
-    outbound = httpx.AsyncClient(transport=httpx.MockTransport(fake.handle))
-    app.dependency_overrides[get_http_client] = lambda: outbound
-
-    return fake
 
 
 async def test_checkout_returns_a_link_and_its_reference(client, kora):

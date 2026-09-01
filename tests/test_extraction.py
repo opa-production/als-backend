@@ -911,3 +911,55 @@ async def test_every_transition_moves_the_cursor(client, ocr_configured):
 
     assert seen == sorted(seen), "a transition did not move updated_at forward"
     assert len(set(seen)) == len(seen), "two transitions share a timestamp"
+
+
+async def test_scans_stuck_with_no_vision_key_are_reported(client, monkeypatch, capsys):
+    """
+    The silent failure, made audible.
+
+    A photograph uploaded to a box with no vision key is never claimed, so no
+    code path runs, nothing raises, and no line appears in any log. The card in
+    the app says "waiting to be read" for ever and the server offers no
+    explanation — which is the shape of problem that costs an afternoon.
+    """
+    monkeypatch.setattr(settings, "google_api_key", "")
+    monkeypatch.setattr(settings, "ocr_api_key", "")
+
+    _, user_id = await sign_in(client)
+    scan_id = await _scan(client, user_id)
+
+    async with client.sessions() as session:
+        # Nothing claims it — that is the bug being reported, not a failure.
+        assert scan_id not in await extraction.claim_batch(session, 10)
+
+        waiting = await extraction.report_unreadable_backlog(session)
+
+    assert waiting == 1
+    # Read off stdout rather than `caplog`: structlog renders straight there,
+    # so the stdlib capture sees nothing even though the line is emitted.
+    printed = capsys.readouterr().out
+    assert "scans_waiting_for_a_vision_key" in printed
+    assert "GOOGLE_API_KEY" in printed
+
+
+async def test_nothing_is_reported_once_a_key_is_set(client, ocr_configured):
+    """A warning that fires when everything is fine is a warning nobody reads."""
+    _, user_id = await sign_in(client)
+    await _scan(client, user_id)
+
+    async with client.sessions() as session:
+        assert await extraction.report_unreadable_backlog(session) == 0
+
+
+def test_the_missing_vision_key_is_named_at_startup(monkeypatch):
+    """
+    Startup lists what will not work. OCR was absent from that list, which is
+    part of why this failed quietly.
+    """
+    monkeypatch.setattr(settings, "google_api_key", "")
+    monkeypatch.setattr(settings, "ocr_api_key", "")
+
+    reported = " ".join(settings.unavailable_features())
+
+    assert "GOOGLE_API_KEY" in reported
+    assert "pending" in reported

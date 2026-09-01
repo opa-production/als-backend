@@ -121,10 +121,29 @@ def test_a_fully_configured_production_warns_about_nothing():
         google_client_ids=["client-id"],
         cors_origins=["https://admin.ardena.xyz"],
         deepseek_api_key="sk-live",
+        # The vision key is separate from the tutor's: DeepSeek cannot see, so a
+        # deployment with a tutor and no OCR is a deployment where every scan
+        # sits unread. It belongs in this list for the same reason as the rest.
+        google_api_key="gemini-live",
         push_enabled=True,
     )
 
     assert settings.unavailable_features() == []
+
+
+def test_a_missing_vision_key_is_named_because_it_fails_silently():
+    """
+    Every other missing key refuses a request and logs it. A scan with no vision
+    key is never *claimed* by the worker, so nothing runs and nothing is
+    written — the card says "waiting to be read" for ever and the log offers no
+    explanation. Startup naming it is most of the fix.
+    """
+    settings = _production(google_api_key="", ocr_api_key="")
+
+    assert settings.fatal_misconfigurations() == []
+    assert any(
+        "GOOGLE_API_KEY" in warning for warning in settings.unavailable_features()
+    )
 
 
 def test_a_missing_ai_key_is_a_warning_not_a_refusal():

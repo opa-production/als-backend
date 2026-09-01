@@ -532,6 +532,16 @@ class Settings(BaseSettings):
                 "no AI provider key is set (DEEPSEEK_API_KEY and friends) — "
                 "/tutor/ask will refuse and the app's tutor will be unavailable"
             )
+        if not self.ocr_key:
+            # Worth saying loudly because this one fails *silently*. Every other
+            # missing key refuses a request and logs it; a scan with no vision
+            # key is simply never claimed by the worker, so it sits at `pending`
+            # for ever and produces no line in any log to explain why.
+            missing.append(
+                "GOOGLE_API_KEY (or OCR_API_KEY) is not set — photographs of "
+                "notes are accepted and then never read. They stay `pending` "
+                "silently; setting a key reads everything that has been waiting"
+            )
         if self.is_production and not self.cors_origins:
             missing.append(
                 "CORS_ORIGINS is empty — the admin console will be blocked by the "

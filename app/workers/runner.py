@@ -187,6 +187,16 @@ class Worker:
             except Exception:  # noqa: BLE001 — extraction must outlive this
                 log.exception("settlement_sweep_failed")
 
+            # The one pipeline failure that is otherwise completely silent: a
+            # photograph on a box with no vision key is never claimed, so no
+            # code path runs and nothing is written anywhere. Rides this cadence
+            # rather than the five-second loop, because it is a standing
+            # condition and one line a minute is plenty to find it by.
+            try:
+                await extraction.report_unreadable_backlog(session)
+            except Exception:  # noqa: BLE001 — extraction must outlive this
+                log.exception("backlog_report_failed")
+
     async def _sleep(self, seconds: float) -> None:
         """
         Sleep, but wake immediately on shutdown.

@@ -34,7 +34,7 @@ from dataclasses import dataclass
 
 import httpx
 import structlog
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.clock import now as utc_now
@@ -509,6 +509,50 @@ async def claim_batch(session: AsyncSession, limit: int) -> list[uuid.UUID]:
         statement = statement.with_for_update(skip_locked=True)
 
     return list((await session.scalars(statement)).all())
+
+
+async def report_unreadable_backlog(session: AsyncSession) -> int:
+    """
+    Says out loud that scans are piling up with nothing able to read them.
+
+    The one failure in this pipeline that is otherwise completely silent. Every
+    other problem produces a line: a broken PDF logs `extraction_failed`, a
+    student over their allowance logs a skip, an unreachable provider logs a
+    requeue. But a photograph uploaded to a box with no vision key is never
+    *claimed* — `runnable_kinds` leaves it out — so no code path runs, nothing
+    raises, and nothing is written anywhere.
+
+    The symptom is a card that says "waiting to be read" for ever and a log with
+    no explanation in it, which is exactly the shape of problem that costs an
+    afternoon. Hence this: one warning per sweep, naming the count and the
+    missing key.
+    """
+    if ocr.configured():
+        return 0
+
+    waiting = await session.scalar(
+        select(func.count())
+        .select_from(Material)
+        .where(
+            Material.extraction_status == "pending",
+            Material.kind == "image",
+            Material.deleted_at.is_(None),
+        )
+    )
+    waiting = waiting or 0
+
+    if waiting:
+        log.warning(
+            "scans_waiting_for_a_vision_key",
+            waiting=waiting,
+            detail=(
+                "GOOGLE_API_KEY (or OCR_API_KEY) is not set, so photographs are "
+                "never claimed. They are not lost -- setting a key reads all of "
+                "them on the next pass."
+            ),
+        )
+
+    return waiting
 
 
 async def requeue_stalled(session: AsyncSession, older_than_minutes: int = 15) -> int:

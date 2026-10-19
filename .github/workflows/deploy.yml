@@ -2,7 +2,8 @@
 #
 # Required repository secrets (Settings > Secrets and variables > Actions):
 #
-#   VPS_HOST       the VPS hostname or public IP, e.g. als.ardena.xyz
+#   VPS_HOST       the VPS address SSH answers on. server2 only accepts SSH
+#                  over the tailnet, so this is its tailnet IP: 100.64.0.2
 #   VPS_USER       als  — not root; see the note in the preflight step below
 #   VPS_SSH_KEY    the deploy private key, whole file including the
 #                  -----BEGIN/-----END lines. Its public half belongs in
@@ -10,6 +11,9 @@
 #
 # Optional:
 #
+#   TS_AUTHKEY     a reusable, ephemeral Headscale pre-auth key. When set, the
+#                  runner joins the tailnet via headscale.ardena.co.ke before
+#                  connecting, which is required while SSH is tailnet-only.
 #   VPS_PORT       if sshd does not listen on 22
 #   VPS_HOST_KEY   the server's public host key line. Without it, the first
 #                  connection of every run trusts whatever answers on that
@@ -84,6 +88,10 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Job-level so the tailnet step's `if:` can see it; secrets cannot appear
+    # in `if:` directly.
+    env:
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
     steps:
       # Checked before anything is attempted, because the failure this replaces
       # was genuinely misleading: an unset VPS_HOST made `ssh-keyscan ""` exit 1
@@ -138,6 +146,18 @@ jobs:
           fi
 
           echo "All required secrets are present."
+
+      # SSH on the VPS is reachable only over the tailnet (Headscale-controlled),
+      # never on the public IP. Join the runner to the tailnet for the length of
+      # this job with an ephemeral pre-auth key, so it drops off when the run
+      # ends. Skipped when TS_AUTHKEY is unset, for a host with public SSH.
+      - name: Join the tailnet
+        if: env.TS_AUTHKEY != ''
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          args: --login-server=https://headscale.ardena.co.ke
+          hostname: github-ci-${{ github.run_id }}
 
       - name: Authorise the SSH key
         env:

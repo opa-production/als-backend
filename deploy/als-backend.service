@@ -44,7 +44,7 @@ Environment=HOME=/opt/als-backend
 # its own address in the logs.
 ExecStart=/opt/als-backend/.venv/bin/uvicorn app.main:app \
     --host 127.0.0.1 \
-    --port 8000 \
+    --port 8002 \
     --workers ${WEB_CONCURRENCY} \
     --proxy-headers \
     --forwarded-allow-ips=127.0.0.1

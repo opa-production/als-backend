@@ -233,7 +233,7 @@ itself — there is no separate webhook secret to copy, unlike Paystack.
 `PUBLIC_BASE_URL` is not decoration. Every charge is opened with
 `notification_url` set to `{PUBLIC_BASE_URL}/api/v1/billing/webhook`, because
 the address cannot be derived from an inbound request: behind nginx the app
-only ever sees `127.0.0.1:8000`. Setting it per environment is also what stops
+only ever sees `127.0.0.1:8002`. Setting it per environment is also what stops
 a staging deploy from registering itself for production's webhooks.
 
 **Dashboard.** Set the webhook URL to the same address as a fallback, and

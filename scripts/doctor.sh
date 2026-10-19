@@ -217,12 +217,12 @@ if command -v curl > /dev/null 2>&1; then
     # Not `... || echo 000`: on a failure curl has usually already printed a
     # code, and appending to it produces nonsense like "000000".
     code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
-        http://127.0.0.1:8000/health 2> /dev/null)
+        http://127.0.0.1:8002/health 2> /dev/null)
     code=${code:-000}
     if [ "$code" = "200" ]; then
-        ok "the app answers on 127.0.0.1:8000/health"
+        ok "the app answers on 127.0.0.1:8002/health"
     else
-        bad "127.0.0.1:8000/health returned $code -- nginx has nothing to proxy to"
+        bad "127.0.0.1:8002/health returned $code -- nginx has nothing to proxy to"
     fi
 else
     warn "no curl, skipping the local health check"

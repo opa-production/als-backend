@@ -12,7 +12,7 @@
 set -euo pipefail
 
 APP_DIR=/opt/als-backend
-HEALTH_URL=http://127.0.0.1:8000/health
+HEALTH_URL=http://127.0.0.1:8002/health
 SERVICE=als-backend
 #: Restarted alongside the API so a deploy does not leave an old worker
 #: parsing with last release's code. Failing to restart it is not fatal — the
